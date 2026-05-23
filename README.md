@@ -134,27 +134,27 @@ LoRA weights are merged into the UNet before inference — no runtime overhead.
 
 ## Troubleshooting
 
-### Одно и то же лицо на всех изображениях
+### Same face on every image
 
-Это особенность модели Araminta, а не баг. Несколько способов получить разнообразие:
+This is a characteristic of the Araminta model, not a bug. A few ways to get more variety:
 
-**Задай явный сид** — без `--seed` генератор инициализируется одинаково:
+**Set an explicit seed** — without `--seed` the generator initializes the same way every run:
 ```bash
 --seed 1234
 --seed 9999
 ```
 
-**Детализируй промпт** — без конкретики модель падает в "средний" образ из обучающих данных:
+**Be specific in your prompt** — vague prompts collapse to the "average" face from the training data:
 ```
 "portrait of an elderly asian woman with wrinkles, gray hair, warm smile"
 ```
 
-**Снизь guidance scale** — высокий CFG усиливает bias датасета:
+**Lower the guidance scale** — high CFG amplifies dataset bias:
 ```bash
 --guidance-scale 5.5
 ```
 
-**Используй негативный промпт:**
+**Use a negative prompt:**
 ```bash
 --uncond-prompt "same face, identical features, clone, blurry, low quality"
 ```
