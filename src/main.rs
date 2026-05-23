@@ -1,3 +1,5 @@
+#![deny(clippy::unwrap_used)]
+
 use candle_transformers::models::{clip, flux, stable_diffusion, t5};
 use stable_diffusion::{
     euler_ancestral_discrete::{
@@ -260,8 +262,9 @@ fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
 
     let img = img.to_device(&Device::Cpu)?;
     let img = ((img.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
-    save_image(&img.i(0)?, args.output.as_deref().unwrap())?;
-    println!("Saved to {}", args.output.as_deref().unwrap());
+    let out = args.output.as_deref().expect("output set in main");
+    save_image(&img.i(0)?, out)?;
+    println!("Saved to {out}");
     Ok(())
 }
 
@@ -339,28 +342,26 @@ fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
 
     // Build embeddings from both encoders and cat along hidden dim
     let text_embeddings = {
+        let ctx = ClipEmbedCtx {
+            prompt: &args.prompt,
+            uncond_prompt: &args.uncond_prompt,
+            clip_skip: args.clip_skip,
+            device,
+            dtype,
+            use_guide_scale,
+        };
         let emb1 = sdxl_clip_emb(
-            &args.prompt,
-            &args.uncond_prompt,
+            &ctx,
             &tok1,
             model_file("text_encoder/model.safetensors")?,
             &sd_config.clip,
-            args.clip_skip,
-            device,
-            dtype,
-            use_guide_scale,
         )?;
-        let clip2_config = sd_config.clip2.as_ref().unwrap();
+        let clip2_config = sd_config.clip2.as_ref().ok_or_else(|| anyhow::anyhow!("SDXL config missing clip2"))?;
         let emb2 = sdxl_clip_emb(
-            &args.prompt,
-            &args.uncond_prompt,
+            &ctx,
             &tok2,
             model_file("text_encoder_2/model.safetensors")?,
             clip2_config,
-            args.clip_skip,
-            device,
-            dtype,
-            use_guide_scale,
         )?;
         // [batch, 77, 768] ++ [batch, 77, 1280] → [batch, 77, 2048]
         Tensor::cat(&[emb1, emb2], D::Minus1)?
@@ -447,8 +448,9 @@ fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     let img = img.to_device(&Device::Cpu)?;
     let img = ((img / 2.)? + 0.5)?.clamp(0f32, 1f32)?;
     let img = (img * 255.)?.to_dtype(DType::U8)?;
-    save_image(&img.i(0)?, args.output.as_deref().unwrap())?;
-    println!("Saved to {}", args.output.as_deref().unwrap());
+    let out = args.output.as_deref().expect("output set in main");
+    save_image(&img.i(0)?, out)?;
+    println!("Saved to {out}");
     Ok(())
 }
 
@@ -698,20 +700,25 @@ impl Scheduler for Dpm2mKarrasScheduler {
     }
 }
 
+struct ClipEmbedCtx<'a> {
+    prompt: &'a str,
+    uncond_prompt: &'a str,
+    clip_skip: usize,
+    device: &'a Device,
+    dtype: DType,
+    use_guide_scale: bool,
+}
+
 fn sdxl_clip_emb(
-    prompt: &str,
-    uncond_prompt: &str,
+    ctx: &ClipEmbedCtx,
     tokenizer: &Tokenizer,
     weights: std::path::PathBuf,
     clip_config: &stable_diffusion::clip::Config,
-    clip_skip: usize,
-    device: &Device,
-    dtype: DType,
-    use_guide_scale: bool,
 ) -> Result<Tensor> {
+    let vocab = tokenizer.get_vocab(true);
     let pad_id = match &clip_config.pad_with {
-        Some(p) => *tokenizer.get_vocab(true).get(p.as_str()).unwrap(),
-        None => *tokenizer.get_vocab(true).get("<|endoftext|>").unwrap(),
+        Some(p) => *vocab.get(p.as_str()).ok_or_else(|| anyhow::anyhow!("pad token '{p}' not in vocab"))?,
+        None => *vocab.get("<|endoftext|>").ok_or_else(|| anyhow::anyhow!("'<|endoftext|>' not in vocab"))?,
     };
     let max_len = clip_config.max_position_embeddings;
 
@@ -722,32 +729,31 @@ fn sdxl_clip_emb(
             .get_ids()
             .to_vec();
         ids.resize(max_len, pad_id);
-        Ok(Tensor::new(ids.as_slice(), device)?.unsqueeze(0)?)
+        Ok(Tensor::new(ids.as_slice(), ctx.device)?.unsqueeze(0)?)
     };
 
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, device)? };
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, ctx.device)? };
     let model = stable_diffusion::clip::ClipTextTransformer::new(vb, clip_config)?;
 
-    // clip_skip=1 → last layer (standard forward), clip_skip=N → N-th from end
     let encode = |tokens: &Tensor| -> Result<Tensor> {
-        if clip_skip <= 1 {
+        if ctx.clip_skip <= 1 {
             Ok(model.forward(tokens)?)
         } else {
-            let layer_idx = -(clip_skip as isize);
+            let layer_idx = -(ctx.clip_skip as isize);
             let (_final, intermediate) =
                 model.forward_until_encoder_layer(tokens, usize::MAX, layer_idx)?;
             Ok(intermediate)
         }
     };
 
-    let cond = encode(&tokenize(prompt)?)?;
-    let emb = if use_guide_scale {
-        let uncond = encode(&tokenize(uncond_prompt)?)?;
+    let cond = encode(&tokenize(ctx.prompt)?)?;
+    let emb = if ctx.use_guide_scale {
+        let uncond = encode(&tokenize(ctx.uncond_prompt)?)?;
         Tensor::cat(&[uncond, cond], 0)?
     } else {
         cond
     };
-    Ok(emb.to_dtype(dtype)?)
+    Ok(emb.to_dtype(ctx.dtype)?)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -773,7 +779,7 @@ fn apply_lora(
         // Base key → LoRA key: replace '.' with '_', prepend "lora_unet_"
         // e.g. "down_blocks.0.attentions.0.to_q.weight"
         //   → "lora_unet_down_blocks_0_attentions_0_to_q"
-        let base = weight_key.strip_suffix(".weight").unwrap();
+        let base = weight_key.strip_suffix(".weight").expect("filtered by ends_with above");
         let lora_base = format!("lora_unet_{}", base.replace('.', "_"));
 
         let down_key = format!("{lora_base}.lora_down.weight");
@@ -797,7 +803,7 @@ fn apply_lora(
         let up = lora_up.to_dtype(DType::F32)?;
         let delta = (up.matmul(&down)? * scale)?;
 
-        let w = tensors.get(&weight_key).unwrap();
+        let w = tensors.get(&weight_key).expect("key came from tensors");
         let orig_dtype = w.dtype();
         let merged = (w.to_dtype(DType::F32)? + delta)?.to_dtype(orig_dtype)?;
         tensors.insert(weight_key, merged);
