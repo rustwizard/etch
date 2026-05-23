@@ -258,6 +258,7 @@ fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
         flux::autoencoder::AutoEncoder::new(&cfg, vb)?.decode(&img)?
     };
 
+    let img = img.to_device(&Device::Cpu)?;
     let img = ((img.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
     save_image(&img.i(0)?, args.output.as_deref().unwrap())?;
     println!("Saved to {}", args.output.as_deref().unwrap());
@@ -438,7 +439,12 @@ fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
         );
     }
 
+    drop(unet);
+    drop(text_embeddings);
+
     let img = vae.decode(&(latents.to_dtype(DType::F32)? / vae_scale)?)?;
+    drop(vae);
+    let img = img.to_device(&Device::Cpu)?;
     let img = ((img / 2.)? + 0.5)?.clamp(0f32, 1f32)?;
     let img = (img * 255.)?.to_dtype(DType::U8)?;
     save_image(&img.i(0)?, args.output.as_deref().unwrap())?;
@@ -810,7 +816,7 @@ fn save_image(img: &Tensor, path: &str) -> Result<()> {
     let abs = std::env::current_dir().unwrap_or_default().join(path);
     let path = abs.as_path();
     println!("Saving image to: {}", path.display());
-    let (c, h, w) = img.dims3()?;
+    let (_c, h, w) = img.dims3()?;
     // Single flat allocation (~3MB) instead of 1M Vec<u8> objects from to_vec2
     let pixels = img.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
     image::save_buffer(path, &pixels, w as u32, h as u32, image::ColorType::Rgb8)?;

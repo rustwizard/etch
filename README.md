@@ -18,6 +18,15 @@ Weights are downloaded automatically from HuggingFace Hub on first run and cache
 - Rust toolchain (`rustup`)
 - HuggingFace account for gated models (FLUX.1-dev)
 
+### Unified memory
+
+| Model | Minimum | Comfortable |
+|-------|---------|-------------|
+| FLUX.1-schnell / dev | 32 GB | 64 GB |
+| Araminta (SDXL) | 16 GB | 24 GB |
+
+FLUX loads ~36 GB of weights in total (DiT + T5-XXL + CLIP). On 32 GB machines it will swap during the run.
+
 ## Build
 
 ```bash
@@ -133,6 +142,12 @@ lora_unet_down_blocks_0_attentions_0_to_q.alpha  (optional)
 LoRA weights are merged into the UNet before inference — no runtime overhead.
 
 ## Troubleshooting
+
+### High swap / slow finish on Apple Silicon
+
+Metal uses an internal memory pool and does not return GPU memory to the OS until the system is under pressure. This is normal behavior — the process may briefly touch swap at the end of a run even after all model weights have been dropped in Rust. There is no workaround within Candle short of patching the Metal allocator.
+
+To reduce peak memory use a smaller model (`--model araminta`) or pass `--cpu` to skip Metal entirely (much slower but no Metal pool overhead).
 
 ### Same face on every image
 
