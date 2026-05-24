@@ -124,8 +124,13 @@ fn main() -> Result<()> {
 
     let output = args.output.clone().unwrap_or_else(|| {
         let n: u32 = rand::random();
-        format!("out-{n}.png")
+        format!("out/out-{seed}-{n}.png")
     });
+    if let Some(parent) = std::path::Path::new(&output).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
     let args = Args { output: Some(output), ..args };
 
     let t0 = std::time::Instant::now();
@@ -134,6 +139,30 @@ fn main() -> Result<()> {
         Model::Araminta => run_sdxl(&args, &device, dtype)?,
     }
     println!("Total time: {:.1}s", t0.elapsed().as_secs_f32());
+
+    let out_path = args.output.as_deref().expect("output set above");
+    let log_path = std::path::Path::new(out_path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("log.jsonl");
+    let mut entry = serde_json::json!({
+        "file": out_path,
+        "seed": seed,
+        "prompt": args.prompt,
+        "model": format!("{:?}", args.model).to_lowercase(),
+        "steps": args.n_steps,
+    });
+    if args.model == Model::Araminta {
+        entry["scheduler"] = serde_json::json!(format!("{:?}", args.scheduler).to_lowercase());
+        entry["guidance_scale"] = serde_json::json!(args.guidance_scale);
+        if !args.uncond_prompt.is_empty() {
+            entry["uncond_prompt"] = serde_json::json!(args.uncond_prompt);
+        }
+    }
+    let mut log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
+    use std::io::Write as _;
+    writeln!(log, "{}", entry)?;
+
     Ok(())
 }
 
