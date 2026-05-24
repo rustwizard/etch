@@ -455,6 +455,48 @@ fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Shared Karras utilities
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Map a Karras sigma back to the nearest discrete timestep in the original
+// schedule. all_sigmas is monotone-increasing (sigma grows with timestep).
+fn sigma_to_t(sigma: f64, all_sigmas: &[f64]) -> usize {
+    let idx = all_sigmas.partition_point(|&s| s < sigma);
+    if idx == 0 { return 0; }
+    if idx >= all_sigmas.len() { return all_sigmas.len() - 1; }
+    if (all_sigmas[idx - 1] - sigma).abs() <= (all_sigmas[idx] - sigma).abs() {
+        idx - 1
+    } else {
+        idx
+    }
+}
+
+// Build the Karras sigma schedule and the matching UNet timesteps.
+fn build_karras_schedule(
+    n_steps: usize,
+    all_sigmas: &[f64],
+    sigma_max: f64,
+    sigma_min: f64,
+) -> (Vec<f64>, Vec<usize>) {
+    const RHO: f64 = 7.0;
+    let min_inv_rho = sigma_min.powf(1.0 / RHO);
+    let max_inv_rho = sigma_max.powf(1.0 / RHO);
+    let mut sigmas: Vec<f64> = (0..n_steps)
+        .map(|i| {
+            let u = i as f64 / (n_steps - 1).max(1) as f64;
+            (max_inv_rho + u * (min_inv_rho - max_inv_rho)).powf(RHO)
+        })
+        .collect();
+    sigmas.push(0.0);
+    // For each Karras sigma find the UNet timestep with the matching noise level.
+    let timesteps: Vec<usize> = sigmas[..n_steps]
+        .iter()
+        .map(|&s| sigma_to_t(s, all_sigmas))
+        .collect();
+    (sigmas, timesteps)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Karras sigma schedule wrapped around EulerA steps
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -470,7 +512,6 @@ impl KarrasEulerAScheduler {
         const BETA_END: f64 = 0.012;
         const TRAIN_STEPS: usize = 1000;
         const STEPS_OFFSET: usize = 1;
-        const RHO: f64 = 7.0;
 
         // ScaledLinear betas (same as EulerA default for SDXL)
         let betas: Vec<f64> = (0..TRAIN_STEPS)
@@ -493,27 +534,12 @@ impl KarrasEulerAScheduler {
             .map(|&a| ((1.0 - a) / a).sqrt())
             .collect();
 
-        // Leading timesteps, same spacing as EulerA default
+        // sigma_max / sigma_min from the standard linear SDXL timestep grid
         let step_ratio = TRAIN_STEPS / n_steps;
-        let timesteps: Vec<usize> = (0..n_steps)
-            .map(|s| s * step_ratio + STEPS_OFFSET)
-            .rev()
-            .collect();
+        let sigma_max = all_sigmas[(n_steps - 1) * step_ratio + STEPS_OFFSET];
+        let sigma_min = all_sigmas[step_ratio + STEPS_OFFSET];
 
-        let sigma_max = all_sigmas[timesteps[0].min(TRAIN_STEPS - 1)];
-        let sigma_min = all_sigmas[timesteps[n_steps - 1].min(TRAIN_STEPS - 1)];
-
-        // Karras sigma schedule: remap [sigma_max..sigma_min] with power-law spacing
-        let min_inv_rho = sigma_min.powf(1.0 / RHO);
-        let max_inv_rho = sigma_max.powf(1.0 / RHO);
-        let mut sigmas: Vec<f64> = (0..n_steps)
-            .map(|i| {
-                let u = i as f64 / (n_steps - 1).max(1) as f64;
-                (max_inv_rho + u * (min_inv_rho - max_inv_rho)).powf(RHO)
-            })
-            .collect();
-        sigmas.push(0.0);
-
+        let (sigmas, timesteps) = build_karras_schedule(n_steps, &all_sigmas, sigma_max, sigma_min);
         let init_noise_sigma = (sigma_max * sigma_max + 1.0).sqrt();
         Ok(Self { sigmas, timesteps, init_noise_sigma })
     }
@@ -565,8 +591,8 @@ impl Scheduler for KarrasEulerAScheduler {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DPM++ 2M Karras scheduler
-// All sigma math is pure Rust f64 — no F64 tensors, Metal-safe.
-// Ref: https://github.com/crowsonkb/k-diffusion (sample_dpmpp_2m)
+// Pure-sigma parameterisation: x = x₀ + σ·ε (α ≡ 1).
+// scale_model_input normalises to unit variance, matching the EulerA convention.
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct Dpm2mKarrasScheduler {
@@ -581,7 +607,6 @@ impl Dpm2mKarrasScheduler {
         const BETA_END: f64 = 0.012;
         const TRAIN_STEPS: usize = 1000;
         const STEPS_OFFSET: usize = 1;
-        const RHO: f64 = 7.0;
 
         let betas: Vec<f64> = (0..TRAIN_STEPS)
             .map(|i| {
@@ -600,23 +625,10 @@ impl Dpm2mKarrasScheduler {
             alphas_cumprod.iter().map(|&a| ((1.0 - a) / a).sqrt()).collect();
 
         let step_ratio = TRAIN_STEPS / n_steps;
-        let timesteps: Vec<usize> = (0..n_steps)
-            .map(|s| s * step_ratio + STEPS_OFFSET)
-            .rev()
-            .collect();
+        let sigma_max = all_sigmas[(n_steps - 1) * step_ratio + STEPS_OFFSET];
+        let sigma_min = all_sigmas[step_ratio + STEPS_OFFSET];
 
-        let sigma_max = all_sigmas[timesteps[0].min(TRAIN_STEPS - 1)];
-        let sigma_min = all_sigmas[timesteps[n_steps - 1].min(TRAIN_STEPS - 1)];
-        let min_inv_rho = sigma_min.powf(1.0 / RHO);
-        let max_inv_rho = sigma_max.powf(1.0 / RHO);
-        let mut sigmas: Vec<f64> = (0..n_steps)
-            .map(|i| {
-                let u = i as f64 / (n_steps - 1).max(1) as f64;
-                (max_inv_rho + u * (min_inv_rho - max_inv_rho)).powf(RHO)
-            })
-            .collect();
-        sigmas.push(0.0);
-
+        let (sigmas, timesteps) = build_karras_schedule(n_steps, &all_sigmas, sigma_max, sigma_min);
         Ok(Self { sigmas, timesteps, prev_denoised: None })
     }
 }
@@ -652,25 +664,24 @@ impl Scheduler for Dpm2mKarrasScheduler {
         let sigma_from = self.sigmas[i];
         let sigma_to = self.sigmas[i + 1];
 
-        // x₀ prediction under epsilon parameterisation
+        // x₀ estimate: D₀ = x - σ·ε  (pure-sigma, α ≡ 1)
         let denoised = (sample - (model_output * sigma_from)?)?;
 
         let x_next = if sigma_to == 0.0 {
             denoised.clone()
         } else {
-            // h = ln(σ_from / σ_to)  — always positive
+            // h = ln(σ_from/σ_to) > 0, ratio = σ_to/σ_from = exp(-h)
             let h = sigma_from.ln() - sigma_to.ln();
-            let ratio = sigma_to / sigma_from; // = exp(-h)
+            let ratio = sigma_to / sigma_from;
 
             match self.prev_denoised.take() {
                 None => {
-                    // 1st step: Euler (1st order)
-                    // x = ratio·x + (1 - ratio)·denoised
+                    // 1st order (exact solution to the sigma-space ODE with constant D₀)
                     ((sample * ratio)? + (&denoised * (1.0 - ratio))?)?
                 }
                 Some(prev_d) => {
-                    // 2nd order DPM++ 2M correction
-                    // h_last = ln(σ_{i-1} / σ_from)
+                    // 2nd order DPM++ 2M midpoint correction
+                    // D₁ = (D₀ - D₀_prev) / r,  denoised_d = D₀ + ½·D₁
                     let h_last = self.sigmas[i - 1].ln() - sigma_from.ln();
                     let r = h_last / h;
                     let c1 = 1.0 + 1.0 / (2.0 * r);
