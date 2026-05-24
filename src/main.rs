@@ -126,10 +126,10 @@ fn main() -> Result<()> {
         let n: u32 = rand::random();
         format!("out/out-{seed}-{n}.png")
     });
-    if let Some(parent) = std::path::Path::new(&output).parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = std::path::Path::new(&output).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     let args = Args { output: Some(output), ..args };
 
