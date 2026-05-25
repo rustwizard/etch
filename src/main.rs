@@ -28,7 +28,6 @@ struct Args {
     uncond_prompt: String,
 
     // (cpu flag defined below near metal)
-
     /// Height in pixels. Default: 768 (FLUX) or 1024 (SDXL).
     #[arg(long)]
     height: Option<usize>,
@@ -140,11 +139,23 @@ fn main() -> Result<()> {
         Device::Cpu
     } else {
         #[cfg(feature = "metal")]
-        { Device::new_metal(0).unwrap_or_else(|e| { tracing::warn!("Metal init failed: {e}. Falling back to CPU."); Device::Cpu }) }
+        {
+            Device::new_metal(0).unwrap_or_else(|e| {
+                tracing::warn!("Metal init failed: {e}. Falling back to CPU.");
+                Device::Cpu
+            })
+        }
         #[cfg(all(feature = "cuda", not(feature = "metal")))]
-        { Device::new_cuda(0).unwrap_or_else(|e| { tracing::warn!("CUDA init failed: {e}. Falling back to CPU."); Device::Cpu }) }
+        {
+            Device::new_cuda(0).unwrap_or_else(|e| {
+                tracing::warn!("CUDA init failed: {e}. Falling back to CPU.");
+                Device::Cpu
+            })
+        }
         #[cfg(not(any(feature = "metal", feature = "cuda")))]
-        { Device::Cpu }
+        {
+            Device::Cpu
+        }
     };
     info!("Device: {:?}", device);
 
@@ -165,11 +176,16 @@ fn main() -> Result<()> {
     {
         std::fs::create_dir_all(parent)?;
     }
-    let args = Args { output: Some(output), ..args };
+    let args = Args {
+        output: Some(output),
+        ..args
+    };
 
     let t0 = std::time::Instant::now();
     match args.model {
-        Model::Schnell | Model::Dev | Model::SchnellGguf | Model::DevGguf => run_flux(&args, &device, dtype)?,
+        Model::Schnell | Model::Dev | Model::SchnellGguf | Model::DevGguf => {
+            run_flux(&args, &device, dtype)?
+        }
         Model::Araminta => run_sdxl(&args, &device, dtype)?,
     }
     info!("Total time: {:.1}s", t0.elapsed().as_secs_f32());
@@ -193,7 +209,10 @@ fn main() -> Result<()> {
             entry["uncond_prompt"] = serde_json::json!(args.uncond_prompt);
         }
     }
-    let mut log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
     use std::io::Write as _;
     writeln!(log, "{}", entry)?;
 
@@ -222,7 +241,9 @@ impl flux::WithForward for FluxModel {
     ) -> candle_core::Result<Tensor> {
         match self {
             FluxModel::Full(m) => m.forward(img, img_ids, txt, txt_ids, timesteps, y, guidance),
-            FluxModel::Quantized(m) => m.forward(img, img_ids, txt, txt_ids, timesteps, y, guidance),
+            FluxModel::Quantized(m) => {
+                m.forward(img, img_ids, txt, txt_ids, timesteps, y, guidance)
+            }
         }
     }
 }
@@ -365,10 +386,15 @@ fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             };
             let (gguf_repo, gguf_file) = match args.model {
                 Model::DevGguf => ("city96/FLUX.1-dev-gguf", format!("flux1-dev-{q}.gguf")),
-                _ => ("city96/FLUX.1-schnell-gguf", format!("flux1-schnell-{q}.gguf")),
+                _ => (
+                    "city96/FLUX.1-schnell-gguf",
+                    format!("flux1-schnell-{q}.gguf"),
+                ),
             };
             let gguf_file = gguf_file.as_str();
-            let path = api.repo(hf_hub::Repo::model(gguf_repo.to_string())).get(gguf_file)?;
+            let path = api
+                .repo(hf_hub::Repo::model(gguf_repo.to_string()))
+                .get(gguf_file)?;
             let vb = load_gguf_with_spinner(&path, gguf_file, device)?;
             FluxModel::Quantized(Box::new(flux::quantized_model::Flux::new(&cfg, vb)?))
         } else {
@@ -389,7 +415,16 @@ fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
                 let (t_curr, t_prev) = (window[0], window[1]);
                 let t_vec = Tensor::full(t_curr as f32, b_sz, &flux_device)?;
                 let step_start = std::time::Instant::now();
-                let pred = flux::WithForward::forward(&model, &img, &state.img_ids, &state.txt, &state.txt_ids, &t_vec, &state.vec, Some(&guidance))?;
+                let pred = flux::WithForward::forward(
+                    &model,
+                    &img,
+                    &state.img_ids,
+                    &state.txt,
+                    &state.txt_ids,
+                    &t_vec,
+                    &state.vec,
+                    Some(&guidance),
+                )?;
                 img = (img + (pred * (t_prev - t_curr))?)?;
                 let step_secs = step_start.elapsed().as_secs_f32();
                 let total_secs = loop_start.elapsed().as_secs_f32();
@@ -398,7 +433,9 @@ fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
                 let bar_len = 20usize;
                 let filled = bar_len * done / n_steps;
                 let bar: String = "█".repeat(filled) + &"░".repeat(bar_len - filled);
-                print!("\rstep {done}/{n_steps} [{bar}] {step_secs:.1}s/step  {total_secs:.0}s elapsed  ETA {eta:.0}s");
+                print!(
+                    "\rstep {done}/{n_steps} [{bar}] {step_secs:.1}s/step  {total_secs:.0}s elapsed  ETA {eta:.0}s"
+                );
                 use std::io::Write as _;
                 let _ = std::io::stdout().flush();
             }
@@ -456,8 +493,7 @@ fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
         }
     };
 
-    let sd_config =
-        stable_diffusion::StableDiffusionConfig::sdxl(None, Some(height), Some(width));
+    let sd_config = stable_diffusion::StableDiffusionConfig::sdxl(None, Some(height), Some(width));
     let mut scheduler: Box<dyn Scheduler> = match args.scheduler {
         SamplerType::EulerA => {
             info!("Scheduler: Euler Ancestral");
@@ -501,6 +537,14 @@ fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
         Tokenizer::from_file(path).map_err(E::msg)?
     };
 
+    // Load LoRA weights once; shared across UNet and both text encoders.
+    let lora_map: Option<std::collections::HashMap<String, Tensor>> = if let Some(p) = &args.lora {
+        info!("Loading LoRA: {p} (scale {})", args.lora_scale);
+        Some(candle_core::safetensors::load(p, &Device::Cpu)?)
+    } else {
+        None
+    };
+
     // Build embeddings from both encoders and cat along hidden dim
     let text_embeddings = {
         let ctx = ClipEmbedCtx {
@@ -516,13 +560,18 @@ fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             &tok1,
             model_file("text_encoder/model.safetensors")?,
             &sd_config.clip,
+            lora_map.as_ref().map(|m| (m, "lora_te1_", args.lora_scale)),
         )?;
-        let clip2_config = sd_config.clip2.as_ref().ok_or_else(|| anyhow::anyhow!("SDXL config missing clip2"))?;
+        let clip2_config = sd_config
+            .clip2
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("SDXL config missing clip2"))?;
         let emb2 = sdxl_clip_emb(
             &ctx,
             &tok2,
             model_file("text_encoder_2/model.safetensors")?,
             clip2_config,
+            lora_map.as_ref().map(|m| (m, "lora_te2_", args.lora_scale)),
         )?;
         // [batch, 77, 768] ++ [batch, 77, 1280] → [batch, 77, 2048]
         Tensor::cat(&[emb1, emb2], D::Minus1)?
@@ -536,10 +585,10 @@ fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     )?;
     let unet = {
         let unet_weights = model_file("unet/diffusion_pytorch_model.safetensors")?;
-        if let Some(lora_path) = &args.lora {
-            info!("Applying LoRA: {lora_path} (scale {})", args.lora_scale);
+        if let Some(lora) = &lora_map {
+            info!("Applying UNet LoRA (scale {})", args.lora_scale);
             let mut tensors = candle_core::safetensors::load(&unet_weights, &Device::Cpu)?;
-            tensors = apply_lora(tensors, lora_path, args.lora_scale, &Device::Cpu)?;
+            tensors = apply_lora(tensors, lora, args.lora_scale)?;
             let vb = VarBuilder::from_tensors(tensors, dtype, device);
             let bc = |out_channels, use_cross_attn, attention_head_dim| unet_2d::BlockConfig {
                 out_channels,
@@ -602,7 +651,9 @@ fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
         let bar_len = 20usize;
         let filled = bar_len * done / n_steps;
         let bar: String = "█".repeat(filled) + &"░".repeat(bar_len - filled);
-        print!("\rstep {done}/{n_steps} [{bar}] {step_secs:.1}s/step  {total_secs:.0}s elapsed  ETA {eta:.0}s");
+        print!(
+            "\rstep {done}/{n_steps} [{bar}] {step_secs:.1}s/step  {total_secs:.0}s elapsed  ETA {eta:.0}s"
+        );
         use std::io::Write as _;
         let _ = std::io::stdout().flush();
     }
@@ -630,8 +681,12 @@ fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
 // schedule. all_sigmas is monotone-increasing (sigma grows with timestep).
 fn sigma_to_t(sigma: f64, all_sigmas: &[f64]) -> usize {
     let idx = all_sigmas.partition_point(|&s| s < sigma);
-    if idx == 0 { return 0; }
-    if idx >= all_sigmas.len() { return all_sigmas.len() - 1; }
+    if idx == 0 {
+        return 0;
+    }
+    if idx >= all_sigmas.len() {
+        return all_sigmas.len() - 1;
+    }
     if (all_sigmas[idx - 1] - sigma).abs() <= (all_sigmas[idx] - sigma).abs() {
         idx - 1
     } else {
@@ -698,7 +753,8 @@ impl KarrasEulerAScheduler {
         }
 
         // sigma_t = sqrt((1 - ᾱ_t) / ᾱ_t)
-        let all_sigmas: Vec<f64> = alphas_cumprod.iter()
+        let all_sigmas: Vec<f64> = alphas_cumprod
+            .iter()
             .map(|&a| ((1.0 - a) / a).sqrt())
             .collect();
 
@@ -709,7 +765,11 @@ impl KarrasEulerAScheduler {
 
         let (sigmas, timesteps) = build_karras_schedule(n_steps, &all_sigmas, sigma_max, sigma_min);
         let init_noise_sigma = (sigma_max * sigma_max + 1.0).sqrt();
-        Ok(Self { sigmas, timesteps, init_noise_sigma })
+        Ok(Self {
+            sigmas,
+            timesteps,
+            init_noise_sigma,
+        })
     }
 }
 
@@ -723,14 +783,29 @@ impl Scheduler for KarrasEulerAScheduler {
     }
 
     fn scale_model_input(&self, sample: Tensor, timestep: usize) -> candle_core::Result<Tensor> {
-        let i = self.timesteps.iter().position(|&t| t == timestep)
-            .ok_or_else(|| candle_core::Error::Msg(format!("timestep {timestep} not in schedule")))?;
+        let i = self
+            .timesteps
+            .iter()
+            .position(|&t| t == timestep)
+            .ok_or_else(|| {
+                candle_core::Error::Msg(format!("timestep {timestep} not in schedule"))
+            })?;
         sample / (self.sigmas[i] * self.sigmas[i] + 1.0).sqrt()
     }
 
-    fn step(&mut self, model_output: &Tensor, timestep: usize, sample: &Tensor) -> candle_core::Result<Tensor> {
-        let i = self.timesteps.iter().position(|&t| t == timestep)
-            .ok_or_else(|| candle_core::Error::Msg(format!("timestep {timestep} not in schedule")))?;
+    fn step(
+        &mut self,
+        model_output: &Tensor,
+        timestep: usize,
+        sample: &Tensor,
+    ) -> candle_core::Result<Tensor> {
+        let i = self
+            .timesteps
+            .iter()
+            .position(|&t| t == timestep)
+            .ok_or_else(|| {
+                candle_core::Error::Msg(format!("timestep {timestep} not in schedule"))
+            })?;
         let sigma_from = self.sigmas[i];
         let sigma_to = self.sigmas[i + 1];
 
@@ -738,8 +813,7 @@ impl Scheduler for KarrasEulerAScheduler {
         let pred_x0 = (sample - (model_output * sigma_from)?)?;
 
         // Stochastic noise split: sigma_up^2 + sigma_down^2 = sigma_to^2
-        let sigma_up = (sigma_to * sigma_to
-            * (sigma_from * sigma_from - sigma_to * sigma_to)
+        let sigma_up = (sigma_to * sigma_to * (sigma_from * sigma_from - sigma_to * sigma_to)
             / (sigma_from * sigma_from))
             .sqrt();
         let sigma_down = (sigma_to * sigma_to - sigma_up * sigma_up).sqrt();
@@ -750,9 +824,19 @@ impl Scheduler for KarrasEulerAScheduler {
         prev_sample + (noise * sigma_up)?
     }
 
-    fn add_noise(&self, original: &Tensor, noise: Tensor, timestep: usize) -> candle_core::Result<Tensor> {
-        let i = self.timesteps.iter().position(|&t| t == timestep)
-            .ok_or_else(|| candle_core::Error::Msg(format!("timestep {timestep} not in schedule")))?;
+    fn add_noise(
+        &self,
+        original: &Tensor,
+        noise: Tensor,
+        timestep: usize,
+    ) -> candle_core::Result<Tensor> {
+        let i = self
+            .timesteps
+            .iter()
+            .position(|&t| t == timestep)
+            .ok_or_else(|| {
+                candle_core::Error::Msg(format!("timestep {timestep} not in schedule"))
+            })?;
         original + (noise * self.sigmas[i])?
     }
 }
@@ -789,15 +873,21 @@ impl Dpm2mKarrasScheduler {
             cumprod *= 1.0 - beta;
             alphas_cumprod.push(cumprod);
         }
-        let all_sigmas: Vec<f64> =
-            alphas_cumprod.iter().map(|&a| ((1.0 - a) / a).sqrt()).collect();
+        let all_sigmas: Vec<f64> = alphas_cumprod
+            .iter()
+            .map(|&a| ((1.0 - a) / a).sqrt())
+            .collect();
 
         let step_ratio = TRAIN_STEPS / n_steps;
         let sigma_max = all_sigmas[(n_steps - 1) * step_ratio + STEPS_OFFSET];
         let sigma_min = all_sigmas[step_ratio + STEPS_OFFSET];
 
         let (sigmas, timesteps) = build_karras_schedule(n_steps, &all_sigmas, sigma_max, sigma_min);
-        Ok(Self { sigmas, timesteps, prev_denoised: None })
+        Ok(Self {
+            sigmas,
+            timesteps,
+            prev_denoised: None,
+        })
     }
 }
 
@@ -807,8 +897,13 @@ impl Scheduler for Dpm2mKarrasScheduler {
     }
 
     fn scale_model_input(&self, sample: Tensor, timestep: usize) -> candle_core::Result<Tensor> {
-        let i = self.timesteps.iter().position(|&t| t == timestep)
-            .ok_or_else(|| candle_core::Error::Msg(format!("timestep {timestep} not in schedule")))?;
+        let i = self
+            .timesteps
+            .iter()
+            .position(|&t| t == timestep)
+            .ok_or_else(|| {
+                candle_core::Error::Msg(format!("timestep {timestep} not in schedule"))
+            })?;
         let sigma = self.sigmas[i];
         sample / (sigma * sigma + 1.0).sqrt()
     }
@@ -828,7 +923,9 @@ impl Scheduler for Dpm2mKarrasScheduler {
             .timesteps
             .iter()
             .position(|&t| t == timestep)
-            .ok_or_else(|| candle_core::Error::Msg(format!("timestep {timestep} not in schedule")))?;
+            .ok_or_else(|| {
+                candle_core::Error::Msg(format!("timestep {timestep} not in schedule"))
+            })?;
         let sigma_from = self.sigmas[i];
         let sigma_to = self.sigmas[i + 1];
 
@@ -874,7 +971,9 @@ impl Scheduler for Dpm2mKarrasScheduler {
             .timesteps
             .iter()
             .position(|&t| t == timestep)
-            .ok_or_else(|| candle_core::Error::Msg(format!("timestep {timestep} not in schedule")))?;
+            .ok_or_else(|| {
+                candle_core::Error::Msg(format!("timestep {timestep} not in schedule"))
+            })?;
         original + (noise * self.sigmas[i])?
     }
 }
@@ -893,11 +992,16 @@ fn sdxl_clip_emb(
     tokenizer: &Tokenizer,
     weights: std::path::PathBuf,
     clip_config: &stable_diffusion::clip::Config,
+    lora: Option<(&std::collections::HashMap<String, Tensor>, &str, f64)>,
 ) -> Result<Tensor> {
     let vocab = tokenizer.get_vocab(true);
     let pad_id = match &clip_config.pad_with {
-        Some(p) => *vocab.get(p.as_str()).ok_or_else(|| anyhow::anyhow!("pad token '{p}' not in vocab"))?,
-        None => *vocab.get("<|endoftext|>").ok_or_else(|| anyhow::anyhow!("'<|endoftext|>' not in vocab"))?,
+        Some(p) => *vocab
+            .get(p.as_str())
+            .ok_or_else(|| anyhow::anyhow!("pad token '{p}' not in vocab"))?,
+        None => *vocab
+            .get("<|endoftext|>")
+            .ok_or_else(|| anyhow::anyhow!("'<|endoftext|>' not in vocab"))?,
     };
     let max_len = clip_config.max_position_embeddings;
 
@@ -911,7 +1015,16 @@ fn sdxl_clip_emb(
         Ok(Tensor::new(ids.as_slice(), ctx.device)?.unsqueeze(0)?)
     };
 
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, ctx.device)? };
+    let vb = if let Some((lora_map, te_prefix, scale)) = lora {
+        let tensors = candle_core::safetensors::load(&weights, &Device::Cpu)?;
+        let (patched, applied) = apply_te_lora(tensors, lora_map, te_prefix, scale)?;
+        if applied > 0 {
+            info!("TE LoRA ({te_prefix}): applied to {applied} layers");
+        }
+        VarBuilder::from_tensors(patched, DType::F32, ctx.device)
+    } else {
+        unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, ctx.device)? }
+    };
     let model = stable_diffusion::clip::ClipTextTransformer::new(vb, clip_config)?;
 
     let encode = |tokens: &Tensor| -> Result<Tensor> {
@@ -941,11 +1054,9 @@ fn sdxl_clip_emb(
 
 fn apply_lora(
     mut tensors: std::collections::HashMap<String, Tensor>,
-    lora_path: &str,
+    lora: &std::collections::HashMap<String, Tensor>,
     lora_scale: f64,
-    device: &Device,
 ) -> Result<std::collections::HashMap<String, Tensor>> {
-    let lora = candle_core::safetensors::load(lora_path, device)?;
     let mut applied = 0usize;
 
     // ── Pass 1: diffusers format ─────────────────────────────────────────────
@@ -959,7 +1070,9 @@ fn apply_lora(
         for weight_key in weight_keys {
             let base = weight_key.strip_suffix(".weight").expect("filtered");
             let lora_base = format!("lora_unet_{}", base.replace('.', "_"));
-            if let Some(merged) = merge_lora_layer(&tensors, &lora, &weight_key, &lora_base, lora_scale)? {
+            if let Some(merged) =
+                merge_lora_layer(&tensors, lora, &weight_key, &lora_base, lora_scale)?
+            {
                 tensors.insert(weight_key, merged);
                 applied += 1;
             }
@@ -978,9 +1091,15 @@ fn apply_lora(
             .collect();
         for lora_full_base in lora_bases {
             let ldm_base = &lora_full_base["lora_unet_".len()..];
-            let Some(unet_key) = ldm_lora_base_to_unet_key(ldm_base) else { continue };
-            if !tensors.contains_key(&unet_key) { continue; }
-            if let Some(merged) = merge_lora_layer(&tensors, &lora, &unet_key, &lora_full_base, lora_scale)? {
+            let Some(unet_key) = ldm_lora_base_to_unet_key(ldm_base) else {
+                continue;
+            };
+            if !tensors.contains_key(&unet_key) {
+                continue;
+            }
+            if let Some(merged) =
+                merge_lora_layer(&tensors, lora, &unet_key, &lora_full_base, lora_scale)?
+            {
                 tensors.insert(unet_key, merged);
                 applied += 1;
             }
@@ -1014,10 +1133,96 @@ fn merge_lora_layer(
     } else {
         lora_scale
     };
-    let delta = (lora_up.to_dtype(DType::F32)?.matmul(&lora_down.to_dtype(DType::F32)?)? * scale)?;
+    let delta = (lora_up
+        .to_dtype(DType::F32)?
+        .matmul(&lora_down.to_dtype(DType::F32)?)?
+        * scale)?;
     let w = tensors.get(weight_key).expect("caller checked");
     let orig = w.dtype();
     Ok(Some((w.to_dtype(DType::F32)? + delta)?.to_dtype(orig)?))
+}
+
+fn apply_te_lora(
+    mut tensors: std::collections::HashMap<String, Tensor>,
+    lora: &std::collections::HashMap<String, Tensor>,
+    te_prefix: &str,
+    lora_scale: f64,
+) -> Result<(std::collections::HashMap<String, Tensor>, usize)> {
+    let mut applied = 0usize;
+    let lora_bases: Vec<String> = lora
+        .keys()
+        .filter_map(|k| k.strip_suffix(".lora_down.weight"))
+        .filter(|k| k.starts_with(te_prefix))
+        .map(str::to_string)
+        .collect();
+    for lora_full_base in lora_bases {
+        let inner = &lora_full_base[te_prefix.len()..];
+        let Some(weight_key) = te_lora_base_to_weight_key(inner) else {
+            continue;
+        };
+        if !tensors.contains_key(&weight_key) {
+            continue;
+        }
+        if let Some(merged) =
+            merge_lora_layer(&tensors, lora, &weight_key, &lora_full_base, lora_scale)?
+        {
+            tensors.insert(weight_key, merged);
+            applied += 1;
+        }
+    }
+    Ok((tensors, applied))
+}
+
+/// Converts the inner part of a TE LoRA base (after stripping "lora_te1_" / "lora_te2_")
+/// to the weight key used in the safetensors file.
+/// e.g. "text_model_encoder_layers_0_self_attn_q_proj" → "text_model.encoder.layers.0.self_attn.q_proj.weight"
+fn te_lora_base_to_weight_key(base: &str) -> Option<String> {
+    const TE_TOKENS: &[(&str, &str)] = &[
+        ("text_model_", "text_model"),
+        ("encoder_", "encoder"),
+        ("layers_", "layers"),
+        ("self_attn_", "self_attn"),
+        ("mlp_", "mlp"),
+        ("layer_norm1", "layer_norm1"),
+        ("layer_norm2", "layer_norm2"),
+        ("out_proj", "out_proj"),
+        ("q_proj", "q_proj"),
+        ("k_proj", "k_proj"),
+        ("v_proj", "v_proj"),
+        ("fc1", "fc1"),
+        ("fc2", "fc2"),
+    ];
+
+    let mut result = String::new();
+    let mut s = base;
+    while !s.is_empty() {
+        let matched = TE_TOKENS.iter().find_map(|&(ldm, diff)| {
+            s.starts_with(ldm).then(|| {
+                s = &s[ldm.len()..];
+                diff
+            })
+        });
+        match matched {
+            Some(tok) => {
+                if !result.is_empty() {
+                    result.push('.');
+                }
+                result.push_str(tok);
+            }
+            None => {
+                let end = s.find('_').unwrap_or(s.len());
+                if !result.is_empty() {
+                    result.push('.');
+                }
+                result.push_str(&s[..end]);
+                s = if end < s.len() { &s[end + 1..] } else { "" };
+            }
+        }
+    }
+    if result.is_empty() {
+        return None;
+    }
+    Some(format!("{result}.weight"))
 }
 
 /// Converts a LoRA base in ldm/ComfyUI format to a diffusers UNet weight key.
@@ -1026,7 +1231,9 @@ fn merge_lora_layer(
 fn ldm_lora_base_to_unet_key(base: &str) -> Option<String> {
     fn pop_num(s: &str) -> Option<(usize, &str)> {
         let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
-        if end == 0 { return None; }
+        if end == 0 {
+            return None;
+        }
         Some((s[..end].parse().ok()?, &s[end..]))
     }
 
@@ -1103,19 +1310,19 @@ fn ldm_suffix_to_diffusers(s: &str) -> String {
     // Ordered longest-first to avoid partial matches.
     const TOKENS: &[(&str, &str)] = &[
         ("transformer_blocks_", "transformer_blocks"),
-        ("to_out_",             "to_out"),
-        ("ff_net_",             "ff.net"),
-        ("attn1_",              "attn1"),
-        ("attn2_",              "attn2"),
-        ("proj_out",            "proj_out"),
-        ("proj_in",             "proj_in"),
-        ("to_out",              "to_out"),
-        ("to_q",                "to_q"),
-        ("to_k",                "to_k"),
-        ("to_v",                "to_v"),
-        ("norm1",               "norm1"),
-        ("norm2",               "norm2"),
-        ("norm3",               "norm3"),
+        ("to_out_", "to_out"),
+        ("ff_net_", "ff.net"),
+        ("attn1_", "attn1"),
+        ("attn2_", "attn2"),
+        ("proj_out", "proj_out"),
+        ("proj_in", "proj_in"),
+        ("to_out", "to_out"),
+        ("to_q", "to_q"),
+        ("to_k", "to_k"),
+        ("to_v", "to_v"),
+        ("norm1", "norm1"),
+        ("norm2", "norm2"),
+        ("norm3", "norm3"),
     ];
 
     let mut result = String::new();
@@ -1129,12 +1336,16 @@ fn ldm_suffix_to_diffusers(s: &str) -> String {
         });
         match matched {
             Some(tok) => {
-                if !result.is_empty() { result.push('.'); }
+                if !result.is_empty() {
+                    result.push('.');
+                }
                 result.push_str(tok);
             }
             None => {
                 let end = s.find('_').unwrap_or(s.len());
-                if !result.is_empty() { result.push('.'); }
+                if !result.is_empty() {
+                    result.push('.');
+                }
                 result.push_str(&s[..end]);
                 s = if end < s.len() { &s[end + 1..] } else { "" };
             }
