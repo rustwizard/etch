@@ -677,6 +677,30 @@ fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
 // Shared Karras utilities
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ScaledLinear beta schedule used by both SDXL Karras schedulers.
+// Returns (all_sigmas, sigma_max, sigma_min) for n_steps inference steps.
+fn build_sdxl_sigmas(n_steps: usize) -> (Vec<f64>, f64, f64) {
+    const BETA_START: f64 = 0.00085;
+    const BETA_END: f64 = 0.012;
+    const TRAIN_STEPS: usize = 1000;
+    const STEPS_OFFSET: usize = 1;
+
+    let mut cumprod = 1.0f64;
+    let all_sigmas: Vec<f64> = (0..TRAIN_STEPS)
+        .map(|i| {
+            let t = i as f64 / (TRAIN_STEPS - 1) as f64;
+            let b = BETA_START.sqrt() + t * (BETA_END.sqrt() - BETA_START.sqrt());
+            cumprod *= 1.0 - b * b;
+            ((1.0 - cumprod) / cumprod).sqrt()
+        })
+        .collect();
+
+    let step_ratio = TRAIN_STEPS / n_steps;
+    let sigma_max = all_sigmas[(n_steps - 1) * step_ratio + STEPS_OFFSET];
+    let sigma_min = all_sigmas[step_ratio + STEPS_OFFSET];
+    (all_sigmas, sigma_max, sigma_min)
+}
+
 // Map a Karras sigma back to the nearest discrete timestep in the original
 // schedule. all_sigmas is monotone-increasing (sigma grows with timestep).
 fn sigma_to_t(sigma: f64, all_sigmas: &[f64]) -> usize {
@@ -731,45 +755,10 @@ struct KarrasEulerAScheduler {
 
 impl KarrasEulerAScheduler {
     fn new(n_steps: usize) -> Result<Self> {
-        const BETA_START: f64 = 0.00085;
-        const BETA_END: f64 = 0.012;
-        const TRAIN_STEPS: usize = 1000;
-        const STEPS_OFFSET: usize = 1;
-
-        // ScaledLinear betas (same as EulerA default for SDXL)
-        let betas: Vec<f64> = (0..TRAIN_STEPS)
-            .map(|i| {
-                let t = i as f64 / (TRAIN_STEPS - 1) as f64;
-                let b = BETA_START.sqrt() + t * (BETA_END.sqrt() - BETA_START.sqrt());
-                b * b
-            })
-            .collect();
-
-        let mut alphas_cumprod = Vec::with_capacity(TRAIN_STEPS);
-        let mut cumprod = 1.0f64;
-        for &beta in &betas {
-            cumprod *= 1.0 - beta;
-            alphas_cumprod.push(cumprod);
-        }
-
-        // sigma_t = sqrt((1 - ᾱ_t) / ᾱ_t)
-        let all_sigmas: Vec<f64> = alphas_cumprod
-            .iter()
-            .map(|&a| ((1.0 - a) / a).sqrt())
-            .collect();
-
-        // sigma_max / sigma_min from the standard linear SDXL timestep grid
-        let step_ratio = TRAIN_STEPS / n_steps;
-        let sigma_max = all_sigmas[(n_steps - 1) * step_ratio + STEPS_OFFSET];
-        let sigma_min = all_sigmas[step_ratio + STEPS_OFFSET];
-
+        let (all_sigmas, sigma_max, sigma_min) = build_sdxl_sigmas(n_steps);
         let (sigmas, timesteps) = build_karras_schedule(n_steps, &all_sigmas, sigma_max, sigma_min);
         let init_noise_sigma = (sigma_max * sigma_max + 1.0).sqrt();
-        Ok(Self {
-            sigmas,
-            timesteps,
-            init_noise_sigma,
-        })
+        Ok(Self { sigmas, timesteps, init_noise_sigma })
     }
 }
 
@@ -855,39 +844,9 @@ struct Dpm2mKarrasScheduler {
 
 impl Dpm2mKarrasScheduler {
     fn new(n_steps: usize) -> Result<Self> {
-        const BETA_START: f64 = 0.00085;
-        const BETA_END: f64 = 0.012;
-        const TRAIN_STEPS: usize = 1000;
-        const STEPS_OFFSET: usize = 1;
-
-        let betas: Vec<f64> = (0..TRAIN_STEPS)
-            .map(|i| {
-                let t = i as f64 / (TRAIN_STEPS - 1) as f64;
-                let b = BETA_START.sqrt() + t * (BETA_END.sqrt() - BETA_START.sqrt());
-                b * b
-            })
-            .collect();
-        let mut alphas_cumprod = Vec::with_capacity(TRAIN_STEPS);
-        let mut cumprod = 1.0f64;
-        for &beta in &betas {
-            cumprod *= 1.0 - beta;
-            alphas_cumprod.push(cumprod);
-        }
-        let all_sigmas: Vec<f64> = alphas_cumprod
-            .iter()
-            .map(|&a| ((1.0 - a) / a).sqrt())
-            .collect();
-
-        let step_ratio = TRAIN_STEPS / n_steps;
-        let sigma_max = all_sigmas[(n_steps - 1) * step_ratio + STEPS_OFFSET];
-        let sigma_min = all_sigmas[step_ratio + STEPS_OFFSET];
-
+        let (all_sigmas, sigma_max, sigma_min) = build_sdxl_sigmas(n_steps);
         let (sigmas, timesteps) = build_karras_schedule(n_steps, &all_sigmas, sigma_max, sigma_min);
-        Ok(Self {
-            sigmas,
-            timesteps,
-            prev_denoised: None,
-        })
+        Ok(Self { sigmas, timesteps, prev_denoised: None })
     }
 }
 
@@ -1089,9 +1048,11 @@ fn apply_lora(
             .filter(|k| k.starts_with("lora_unet_"))
             .map(str::to_string)
             .collect();
+        let mut skipped = 0usize;
         for lora_full_base in lora_bases {
             let ldm_base = &lora_full_base["lora_unet_".len()..];
             let Some(unet_key) = ldm_lora_base_to_unet_key(ldm_base) else {
+                skipped += 1;
                 continue;
             };
             if !tensors.contains_key(&unet_key) {
@@ -1103,6 +1064,9 @@ fn apply_lora(
                 tensors.insert(unet_key, merged);
                 applied += 1;
             }
+        }
+        if skipped > 0 {
+            tracing::warn!("UNet LoRA: {skipped} ldm keys skipped (unmapped block indices)");
         }
     }
 
@@ -1155,9 +1119,11 @@ fn apply_te_lora(
         .filter(|k| k.starts_with(te_prefix))
         .map(str::to_string)
         .collect();
+    let mut skipped = 0usize;
     for lora_full_base in lora_bases {
         let inner = &lora_full_base[te_prefix.len()..];
         let Some(weight_key) = te_lora_base_to_weight_key(inner) else {
+            skipped += 1;
             continue;
         };
         if !tensors.contains_key(&weight_key) {
@@ -1170,6 +1136,9 @@ fn apply_te_lora(
             applied += 1;
         }
     }
+    if skipped > 0 {
+        tracing::warn!("TE LoRA ({te_prefix}): {skipped} keys had no weight mapping");
+    }
     Ok((tensors, applied))
 }
 
@@ -1178,50 +1147,22 @@ fn apply_te_lora(
 /// e.g. "text_model_encoder_layers_0_self_attn_q_proj" → "text_model.encoder.layers.0.self_attn.q_proj.weight"
 fn te_lora_base_to_weight_key(base: &str) -> Option<String> {
     const TE_TOKENS: &[(&str, &str)] = &[
-        ("text_model_", "text_model"),
-        ("encoder_", "encoder"),
-        ("layers_", "layers"),
-        ("self_attn_", "self_attn"),
-        ("mlp_", "mlp"),
-        ("layer_norm1", "layer_norm1"),
-        ("layer_norm2", "layer_norm2"),
-        ("out_proj", "out_proj"),
-        ("q_proj", "q_proj"),
-        ("k_proj", "k_proj"),
-        ("v_proj", "v_proj"),
-        ("fc1", "fc1"),
-        ("fc2", "fc2"),
+        ("text_model_",  "text_model"),
+        ("encoder_",     "encoder"),
+        ("layers_",      "layers"),
+        ("self_attn_",   "self_attn"),
+        ("mlp_",         "mlp"),
+        ("layer_norm1",  "layer_norm1"),
+        ("layer_norm2",  "layer_norm2"),
+        ("out_proj",     "out_proj"),
+        ("q_proj",       "q_proj"),
+        ("k_proj",       "k_proj"),
+        ("v_proj",       "v_proj"),
+        ("fc1",          "fc1"),
+        ("fc2",          "fc2"),
     ];
-
-    let mut result = String::new();
-    let mut s = base;
-    while !s.is_empty() {
-        let matched = TE_TOKENS.iter().find_map(|&(ldm, diff)| {
-            s.starts_with(ldm).then(|| {
-                s = &s[ldm.len()..];
-                diff
-            })
-        });
-        match matched {
-            Some(tok) => {
-                if !result.is_empty() {
-                    result.push('.');
-                }
-                result.push_str(tok);
-            }
-            None => {
-                let end = s.find('_').unwrap_or(s.len());
-                if !result.is_empty() {
-                    result.push('.');
-                }
-                result.push_str(&s[..end]);
-                s = if end < s.len() { &s[end + 1..] } else { "" };
-            }
-        }
-    }
-    if result.is_empty() {
-        return None;
-    }
+    let result = greedy_tokenize(base, TE_TOKENS);
+    if result.is_empty() { return None; }
     Some(format!("{result}.weight"))
 }
 
@@ -1304,10 +1245,37 @@ fn sdxl_middle_block(n: usize) -> Option<String> {
     }
 }
 
+/// Greedy underscore-to-dot tokenizer shared by UNet and TE LoRA key converters.
+/// Scans `s` left-to-right, replacing known multi-word tokens first (longest-match
+/// via table order), then falling back to consuming one `_`-delimited segment.
+fn greedy_tokenize(mut s: &str, tokens: &[(&str, &str)]) -> String {
+    let mut result = String::new();
+    while !s.is_empty() {
+        let matched = tokens.iter().find_map(|&(ldm, diff)| {
+            s.starts_with(ldm).then(|| {
+                s = &s[ldm.len()..];
+                diff
+            })
+        });
+        match matched {
+            Some(tok) => {
+                if !result.is_empty() { result.push('.'); }
+                result.push_str(tok);
+            }
+            None => {
+                let end = s.find('_').unwrap_or(s.len());
+                if !result.is_empty() { result.push('.'); }
+                result.push_str(&s[..end]);
+                s = if end < s.len() { &s[end + 1..] } else { "" };
+            }
+        }
+    }
+    result
+}
+
 /// Converts the module-path portion of an ldm LoRA key to diffusers dot-notation.
 /// e.g. "transformer_blocks_0_attn1_to_out_0" → "transformer_blocks.0.attn1.to_out.0"
 fn ldm_suffix_to_diffusers(s: &str) -> String {
-    // Ordered longest-first to avoid partial matches.
     const TOKENS: &[(&str, &str)] = &[
         ("transformer_blocks_", "transformer_blocks"),
         ("to_out_", "to_out"),
@@ -1324,34 +1292,7 @@ fn ldm_suffix_to_diffusers(s: &str) -> String {
         ("norm2", "norm2"),
         ("norm3", "norm3"),
     ];
-
-    let mut result = String::new();
-    let mut s = s;
-    while !s.is_empty() {
-        let matched = TOKENS.iter().find_map(|&(ldm, diff)| {
-            s.starts_with(ldm).then(|| {
-                s = &s[ldm.len()..];
-                diff
-            })
-        });
-        match matched {
-            Some(tok) => {
-                if !result.is_empty() {
-                    result.push('.');
-                }
-                result.push_str(tok);
-            }
-            None => {
-                let end = s.find('_').unwrap_or(s.len());
-                if !result.is_empty() {
-                    result.push('.');
-                }
-                result.push_str(&s[..end]);
-                s = if end < s.len() { &s[end + 1..] } else { "" };
-            }
-        }
-    }
-    result
+    greedy_tokenize(s, TOKENS)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
