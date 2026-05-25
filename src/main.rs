@@ -1092,11 +1092,11 @@ fn sdxl_middle_block(n: usize) -> Option<String> {
 fn ldm_suffix_to_diffusers(s: &str) -> String {
     // Ordered longest-first to avoid partial matches.
     const TOKENS: &[(&str, &str)] = &[
-        ("transformer_blocks_", "transformer_blocks."),
-        ("to_out_",             "to_out."),
-        ("ff_net_",             "ff.net."),
-        ("attn1_",              "attn1."),
-        ("attn2_",              "attn2."),
+        ("transformer_blocks_", "transformer_blocks"),
+        ("to_out_",             "to_out"),
+        ("ff_net_",             "ff.net"),
+        ("attn1_",              "attn1"),
+        ("attn2_",              "attn2"),
         ("proj_out",            "proj_out"),
         ("proj_in",             "proj_in"),
         ("to_out",              "to_out"),
