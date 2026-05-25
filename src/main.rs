@@ -1,6 +1,7 @@
 #![deny(clippy::unwrap_used)]
 
 use candle_transformers::models::{clip, flux, stable_diffusion, t5};
+use candle_transformers::quantized_var_builder::VarBuilder as QVarBuilder;
 use stable_diffusion::{
     euler_ancestral_discrete::{
         EulerAncestralDiscreteScheduler, EulerAncestralDiscreteSchedulerConfig,
@@ -78,6 +79,23 @@ struct Args {
     /// Sampler (SDXL only).
     #[arg(long, value_enum, default_value = "euler-a")]
     scheduler: SamplerType,
+
+    /// Path to a local FLUX GGUF file (e.g. flux1-schnell-Q8_0.gguf). Skips HF download.
+    #[arg(long)]
+    gguf: Option<String>,
+
+    /// Quantization level for schnell-gguf / dev-gguf models (default: q8).
+    #[arg(long, value_enum, default_value = "q8")]
+    quantization: Quantization,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq, Default)]
+enum Quantization {
+    /// Q8_0 — ~12 GB, best quality
+    #[default]
+    Q8,
+    /// Q4_K_S — ~7 GB, smaller but slightly lower quality
+    Q4,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq, Default)]
@@ -93,10 +111,14 @@ enum SamplerType {
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
 enum Model {
-    /// FLUX.1-schnell — 4 steps, fast, Apache 2.0
+    /// FLUX.1-schnell — 4 steps, fast, Apache 2.0 (~24 GB safetensors)
     Schnell,
-    /// FLUX.1-dev — 50 steps, best quality, non-commercial
+    /// FLUX.1-dev — 50 steps, best quality, non-commercial (~24 GB safetensors)
     Dev,
+    /// FLUX.1-schnell Q8_0 GGUF — 4 steps, ~12 GB
+    SchnellGguf,
+    /// FLUX.1-dev Q8_0 GGUF — 50 steps, ~12 GB, non-commercial
+    DevGguf,
     /// John6666/the-araminta-experiment-fv5-sdxl — ~7 GB SDXL
     Araminta,
 }
@@ -118,7 +140,9 @@ fn main() -> Result<()> {
 
     let seed = args.seed.unwrap_or_else(rand::random);
     println!("Seed: {seed}");
-    device.set_seed(seed)?;
+    if !matches!(device, Device::Cpu) {
+        device.set_seed(seed)?;
+    }
 
     let dtype = DType::F32;
 
@@ -135,7 +159,7 @@ fn main() -> Result<()> {
 
     let t0 = std::time::Instant::now();
     match args.model {
-        Model::Schnell | Model::Dev => run_flux(&args, &device, dtype)?,
+        Model::Schnell | Model::Dev | Model::SchnellGguf | Model::DevGguf => run_flux(&args, &device, dtype)?,
         Model::Araminta => run_sdxl(&args, &device, dtype)?,
     }
     println!("Total time: {:.1}s", t0.elapsed().as_secs_f32());
@@ -170,14 +194,79 @@ fn main() -> Result<()> {
 // FLUX pipeline
 // ─────────────────────────────────────────────────────────────────────────────
 
+enum FluxModel {
+    Full(flux::model::Flux),
+    Quantized(flux::quantized_model::Flux),
+}
+
+impl flux::WithForward for FluxModel {
+    fn forward(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        y: &Tensor,
+        guidance: Option<&Tensor>,
+    ) -> candle_core::Result<Tensor> {
+        match self {
+            FluxModel::Full(m) => m.forward(img, img_ids, txt, txt_ids, timesteps, y, guidance),
+            FluxModel::Quantized(m) => m.forward(img, img_ids, txt, txt_ids, timesteps, y, guidance),
+        }
+    }
+}
+
+fn load_gguf_with_spinner(
+    path: impl AsRef<std::path::Path>,
+    label: &str,
+    _device: &Device,
+) -> Result<QVarBuilder> {
+    use std::io::Write as _;
+    let spinner = ['|', '/', '-', '\\'];
+    print!("Loading GGUF: {label}  ");
+    let _ = std::io::stdout().flush();
+
+    let path = path.as_ref().to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<QVarBuilder>>();
+    std::thread::spawn(move || {
+        let _ = tx.send(QVarBuilder::from_gguf(path, &Device::Cpu).map_err(Into::into));
+    });
+
+    let mut i = 0usize;
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(120)) {
+            Ok(result) => {
+                print!("\rLoading GGUF: {label}  done\n");
+                let _ = std::io::stdout().flush();
+                return result;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                print!("\rLoading GGUF: {label}  {}", spinner[i % 4]);
+                let _ = std::io::stdout().flush();
+                i += 1;
+            }
+            Err(e) => return Err(anyhow::anyhow!("GGUF loader thread error: {e}")),
+        }
+    }
+}
+
 fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     let height = args.height.unwrap_or(768);
     let width = args.width.unwrap_or(1360);
     let api = hf_hub::api::sync::Api::new()?;
 
+    // GGUF weights live in CPU RAM; run the entire DiT on CPU to avoid device
+    // mismatches (layer norms, biases all come from the CPU VarBuilder) and to
+    // prevent Metal OOM from T5 (9.5 GB) and GGUF (7–12 GB) overlapping.
+    // T5 and CLIP still encode on Metal for speed; only their small output
+    // embeddings are moved to CPU before FLUX inference.
+    let is_gguf = args.gguf.is_some() || matches!(args.model, Model::SchnellGguf | Model::DevGguf);
+    let flux_device = if is_gguf { Device::Cpu } else { device.clone() };
+
     let bf_repo = {
         let name = match args.model {
-            Model::Dev => "black-forest-labs/FLUX.1-dev",
+            Model::Dev | Model::DevGguf => "black-forest-labs/FLUX.1-dev",
             _ => "black-forest-labs/FLUX.1-schnell",
         };
         api.repo(hf_hub::Repo::model(name.to_string()))
@@ -185,11 +274,7 @@ fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
 
     // T5 text encoder
     let t5_emb = {
-        let repo = api.repo(hf_hub::Repo::with_revision(
-            "google/t5-v1_1-xxl".to_string(),
-            hf_hub::RepoType::Model,
-            "refs/pr/2".to_string(),
-        ));
+        let repo = api.model("mcmonkey/google_t5-v1_1-xxl_encoderonly".to_string());
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[repo.get("model.safetensors")?], dtype, device)?
         };
@@ -206,7 +291,8 @@ fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             .get_ids()
             .to_vec();
         tokens.resize(256, 0);
-        model.forward(&Tensor::new(&tokens[..], device)?.unsqueeze(0)?)?
+        let emb = model.forward(&Tensor::new(&tokens[..], device)?.unsqueeze(0)?)?;
+        emb.to_device(&flux_device)?
     };
     println!("T5: {:?}", t5_emb.shape());
 
@@ -236,45 +322,78 @@ fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             .map_err(E::msg)?
             .get_ids()
             .to_vec();
-        model.forward(&Tensor::new(&tokens[..], device)?.unsqueeze(0)?)?
+        let emb = model.forward(&Tensor::new(&tokens[..], device)?.unsqueeze(0)?)?;
+        emb.to_device(&flux_device)?
     };
     println!("CLIP: {:?}", clip_emb.shape());
 
     // FLUX DiT
     let img = {
         let cfg = match args.model {
-            Model::Dev => flux::model::Config::dev(),
+            Model::Dev | Model::DevGguf => flux::model::Config::dev(),
             _ => flux::model::Config::schnell(),
         };
-        let img = flux::sampling::get_noise(1, height, width, device)?.to_dtype(dtype)?;
+        let img = flux::sampling::get_noise(1, height, width, &flux_device)?.to_dtype(dtype)?;
         let state = flux::sampling::State::new(&t5_emb, &clip_emb, &img)?;
         let n_steps = args.n_steps.unwrap_or(match args.model {
-            Model::Dev => 50,
+            Model::Dev | Model::DevGguf => 50,
             _ => 4,
         });
         let timesteps = match args.model {
-            Model::Dev => {
+            Model::Dev | Model::DevGguf => {
                 flux::sampling::get_schedule(n_steps, Some((state.img.dim(1)?, 0.5, 1.15)))
             }
             _ => flux::sampling::get_schedule(n_steps, None),
         };
-        let model_file = match args.model {
-            Model::Dev => bf_repo.get("flux1-dev.safetensors")?,
-            _ => bf_repo.get("flux1-schnell.safetensors")?,
+        let model = if let Some(gguf_path) = &args.gguf {
+            let vb = load_gguf_with_spinner(gguf_path, gguf_path, device)?;
+            FluxModel::Quantized(flux::quantized_model::Flux::new(&cfg, vb)?)
+        } else if matches!(args.model, Model::SchnellGguf | Model::DevGguf) {
+            let q = match args.quantization {
+                Quantization::Q8 => "Q8_0",
+                Quantization::Q4 => "Q4_K_S",
+            };
+            let (gguf_repo, gguf_file) = match args.model {
+                Model::DevGguf => ("city96/FLUX.1-dev-gguf", format!("flux1-dev-{q}.gguf")),
+                _ => ("city96/FLUX.1-schnell-gguf", format!("flux1-schnell-{q}.gguf")),
+            };
+            let gguf_file = gguf_file.as_str();
+            let path = api.repo(hf_hub::Repo::model(gguf_repo.to_string())).get(gguf_file)?;
+            let vb = load_gguf_with_spinner(&path, gguf_file, device)?;
+            FluxModel::Quantized(flux::quantized_model::Flux::new(&cfg, vb)?)
+        } else {
+            let model_file = match args.model {
+                Model::Dev => bf_repo.get("flux1-dev.safetensors")?,
+                _ => bf_repo.get("flux1-schnell.safetensors")?,
+            };
+            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[model_file], dtype, device)? };
+            FluxModel::Full(flux::model::Flux::new(&cfg, vb)?)
         };
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[model_file], dtype, device)? };
-        let model = flux::model::Flux::new(&cfg, vb)?;
-        let denoised = flux::sampling::denoise(
-            &model,
-            &state.img,
-            &state.img_ids,
-            &state.txt,
-            &state.txt_ids,
-            &state.vec,
-            &timesteps,
-            4.,
-        )?;
-        flux::sampling::unpack(&denoised, height, width)?
+        let denoised = {
+            let n_steps = timesteps.len().saturating_sub(1);
+            let b_sz = state.img.dim(0)?;
+            let guidance = Tensor::full(4f32, b_sz, &flux_device)?;
+            let mut img = state.img.clone();
+            for (i, window) in timesteps.windows(2).enumerate() {
+                let (t_curr, t_prev) = (window[0], window[1]);
+                let t_vec = Tensor::full(t_curr as f32, b_sz, &flux_device)?;
+                let step_start = std::time::Instant::now();
+                let pred = flux::WithForward::forward(&model, &img, &state.img_ids, &state.txt, &state.txt_ids, &t_vec, &state.vec, Some(&guidance))?;
+                img = (img + (pred * (t_prev - t_curr))?)?;
+                let elapsed = step_start.elapsed().as_secs_f32();
+                let done = i + 1;
+                let bar_len = 20usize;
+                let filled = bar_len * done / n_steps;
+                let bar: String = "█".repeat(filled) + &"░".repeat(bar_len - filled);
+                print!("\rstep {done}/{n_steps} [{bar}] {elapsed:.1}s/step");
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+            }
+            println!();
+            img
+        };
+        let unpacked = flux::sampling::unpack(&denoised, height, width)?;
+        unpacked.to_device(device)?
     };
 
     // VAE decode
@@ -283,7 +402,7 @@ fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             VarBuilder::from_mmaped_safetensors(&[bf_repo.get("ae.safetensors")?], dtype, device)?
         };
         let cfg = match args.model {
-            Model::Dev => flux::autoencoder::Config::dev(),
+            Model::Dev | Model::DevGguf => flux::autoencoder::Config::dev(),
             _ => flux::autoencoder::Config::schnell(),
         };
         flux::autoencoder::AutoEncoder::new(&cfg, vb)?.decode(&img)?
@@ -462,12 +581,16 @@ fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             noise_pred
         };
         latents = scheduler.step(&noise_pred, timestep, &latents)?;
-        println!(
-            "step {}/{n_steps} — {:.1}s",
-            i + 1,
-            t_step.elapsed().as_secs_f32()
-        );
+        let elapsed = t_step.elapsed().as_secs_f32();
+        let done = i + 1;
+        let bar_len = 20usize;
+        let filled = bar_len * done / n_steps;
+        let bar: String = "█".repeat(filled) + &"░".repeat(bar_len - filled);
+        print!("\rstep {done}/{n_steps} [{bar}] {elapsed:.1}s/step");
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
     }
+    println!();
 
     drop(unet);
     drop(text_embeddings);
