@@ -374,18 +374,21 @@ fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             let b_sz = state.img.dim(0)?;
             let guidance = Tensor::full(4f32, b_sz, &flux_device)?;
             let mut img = state.img.clone();
+            let loop_start = std::time::Instant::now();
             for (i, window) in timesteps.windows(2).enumerate() {
                 let (t_curr, t_prev) = (window[0], window[1]);
                 let t_vec = Tensor::full(t_curr as f32, b_sz, &flux_device)?;
                 let step_start = std::time::Instant::now();
                 let pred = flux::WithForward::forward(&model, &img, &state.img_ids, &state.txt, &state.txt_ids, &t_vec, &state.vec, Some(&guidance))?;
                 img = (img + (pred * (t_prev - t_curr))?)?;
-                let elapsed = step_start.elapsed().as_secs_f32();
+                let step_secs = step_start.elapsed().as_secs_f32();
+                let total_secs = loop_start.elapsed().as_secs_f32();
                 let done = i + 1;
+                let eta = step_secs * (n_steps - done) as f32;
                 let bar_len = 20usize;
                 let filled = bar_len * done / n_steps;
                 let bar: String = "█".repeat(filled) + &"░".repeat(bar_len - filled);
-                print!("\rstep {done}/{n_steps} [{bar}] {elapsed:.1}s/step");
+                print!("\rstep {done}/{n_steps} [{bar}] {step_secs:.1}s/step  {total_secs:.0}s elapsed  ETA {eta:.0}s");
                 use std::io::Write as _;
                 let _ = std::io::stdout().flush();
             }
@@ -564,6 +567,7 @@ fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
         .to_dtype(dtype)?;
 
     let timesteps = scheduler.timesteps().to_vec();
+    let loop_start = std::time::Instant::now();
     for (i, &timestep) in timesteps.iter().enumerate() {
         let t_step = std::time::Instant::now();
         let latent_input = if use_guide_scale {
@@ -581,12 +585,14 @@ fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             noise_pred
         };
         latents = scheduler.step(&noise_pred, timestep, &latents)?;
-        let elapsed = t_step.elapsed().as_secs_f32();
+        let step_secs = t_step.elapsed().as_secs_f32();
+        let total_secs = loop_start.elapsed().as_secs_f32();
         let done = i + 1;
+        let eta = step_secs * (n_steps - done) as f32;
         let bar_len = 20usize;
         let filled = bar_len * done / n_steps;
         let bar: String = "█".repeat(filled) + &"░".repeat(bar_len - filled);
-        print!("\rstep {done}/{n_steps} [{bar}] {elapsed:.1}s/step");
+        print!("\rstep {done}/{n_steps} [{bar}] {step_secs:.1}s/step  {total_secs:.0}s elapsed  ETA {eta:.0}s");
         use std::io::Write as _;
         let _ = std::io::stdout().flush();
     }
@@ -932,49 +938,199 @@ fn apply_lora(
     let lora = candle_core::safetensors::load(lora_path, device)?;
     let mut applied = 0usize;
 
-    let weight_keys: Vec<String> = tensors
-        .keys()
-        .filter(|k| k.ends_with(".weight"))
-        .cloned()
-        .collect();
-
-    for weight_key in weight_keys {
-        // Base key → LoRA key: replace '.' with '_', prepend "lora_unet_"
-        // e.g. "down_blocks.0.attentions.0.to_q.weight"
-        //   → "lora_unet_down_blocks_0_attentions_0_to_q"
-        let base = weight_key.strip_suffix(".weight").expect("filtered by ends_with above");
-        let lora_base = format!("lora_unet_{}", base.replace('.', "_"));
-
-        let down_key = format!("{lora_base}.lora_down.weight");
-        let up_key = format!("{lora_base}.lora_up.weight");
-
-        let (Some(lora_down), Some(lora_up)) = (lora.get(&down_key), lora.get(&up_key)) else {
-            continue;
-        };
-
-        let rank = lora_down.dim(0)?;
-        let alpha_key = format!("{lora_base}.alpha");
-        let scale = if let Some(alpha) = lora.get(&alpha_key) {
-            let alpha_val = alpha.to_vec0::<f32>()? as f64;
-            lora_scale * alpha_val / rank as f64
-        } else {
-            lora_scale
-        };
-
-        // delta = scale * (lora_up @ lora_down)  shape: [out, in]
-        let down = lora_down.to_dtype(DType::F32)?;
-        let up = lora_up.to_dtype(DType::F32)?;
-        let delta = (up.matmul(&down)? * scale)?;
-
-        let w = tensors.get(&weight_key).expect("key came from tensors");
-        let orig_dtype = w.dtype();
-        let merged = (w.to_dtype(DType::F32)? + delta)?.to_dtype(orig_dtype)?;
-        tensors.insert(weight_key, merged);
-        applied += 1;
+    // ── Pass 1: diffusers format ─────────────────────────────────────────────
+    // UNet key "a.b.c.weight" → LoRA base "lora_unet_a_b_c"
+    {
+        let weight_keys: Vec<String> = tensors
+            .keys()
+            .filter(|k| k.ends_with(".weight"))
+            .cloned()
+            .collect();
+        for weight_key in weight_keys {
+            let base = weight_key.strip_suffix(".weight").expect("filtered");
+            let lora_base = format!("lora_unet_{}", base.replace('.', "_"));
+            if let Some(merged) = merge_lora_layer(&tensors, &lora, &weight_key, &lora_base, lora_scale)? {
+                tensors.insert(weight_key, merged);
+                applied += 1;
+            }
+        }
     }
 
+    // ── Pass 2: ldm / ComfyUI format ────────────────────────────────────────
+    // LoRA base "lora_unet_input_blocks_N_M_..." → UNet key via block mapping.
+    // Only runs when Pass 1 matched nothing (avoids double-applying).
+    if applied == 0 {
+        let lora_bases: Vec<String> = lora
+            .keys()
+            .filter_map(|k| k.strip_suffix(".lora_down.weight"))
+            .filter(|k| k.starts_with("lora_unet_"))
+            .map(str::to_string)
+            .collect();
+        for lora_full_base in lora_bases {
+            let ldm_base = &lora_full_base["lora_unet_".len()..];
+            let Some(unet_key) = ldm_lora_base_to_unet_key(ldm_base) else { continue };
+            if !tensors.contains_key(&unet_key) { continue; }
+            if let Some(merged) = merge_lora_layer(&tensors, &lora, &unet_key, &lora_full_base, lora_scale)? {
+                tensors.insert(unet_key, merged);
+                applied += 1;
+            }
+        }
+    }
+
+    if applied == 0 {
+        let sample: Vec<_> = lora.keys().take(5).collect();
+        anyhow::bail!("LoRA matched 0 UNet layers.\nFirst keys in file: {sample:?}");
+    }
     println!("LoRA applied to {applied} layers");
     Ok(tensors)
+}
+
+fn merge_lora_layer(
+    tensors: &std::collections::HashMap<String, Tensor>,
+    lora: &std::collections::HashMap<String, Tensor>,
+    weight_key: &str,
+    lora_base: &str,
+    lora_scale: f64,
+) -> Result<Option<Tensor>> {
+    let (Some(lora_down), Some(lora_up)) = (
+        lora.get(&format!("{lora_base}.lora_down.weight")),
+        lora.get(&format!("{lora_base}.lora_up.weight")),
+    ) else {
+        return Ok(None);
+    };
+    let rank = lora_down.dim(0)?;
+    let scale = if let Some(alpha) = lora.get(&format!("{lora_base}.alpha")) {
+        lora_scale * alpha.to_dtype(DType::F32)?.to_vec0::<f32>()? as f64 / rank as f64
+    } else {
+        lora_scale
+    };
+    let delta = (lora_up.to_dtype(DType::F32)?.matmul(&lora_down.to_dtype(DType::F32)?)? * scale)?;
+    let w = tensors.get(weight_key).expect("caller checked");
+    let orig = w.dtype();
+    Ok(Some((w.to_dtype(DType::F32)? + delta)?.to_dtype(orig)?))
+}
+
+/// Converts a LoRA base in ldm/ComfyUI format to a diffusers UNet weight key.
+/// e.g. "input_blocks_4_1_transformer_blocks_0_attn1_to_q"
+///   → "down_blocks.1.attentions.0.transformer_blocks.0.attn1.to_q.weight"
+fn ldm_lora_base_to_unet_key(base: &str) -> Option<String> {
+    fn pop_num(s: &str) -> Option<(usize, &str)> {
+        let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+        if end == 0 { return None; }
+        Some((s[..end].parse().ok()?, &s[end..]))
+    }
+
+    let (block_prefix, rest) = if let Some(s) = base.strip_prefix("input_blocks_") {
+        let (n, s) = pop_num(s)?;
+        let s = s.strip_prefix('_')?;
+        let (m, s) = pop_num(s)?;
+        let rest = s.strip_prefix('_').unwrap_or(s);
+        (sdxl_input_block(n, m)?, rest)
+    } else if let Some(s) = base.strip_prefix("output_blocks_") {
+        let (n, s) = pop_num(s)?;
+        let s = s.strip_prefix('_')?;
+        let (m, s) = pop_num(s)?;
+        let rest = s.strip_prefix('_').unwrap_or(s);
+        (sdxl_output_block(n, m)?, rest)
+    } else if let Some(s) = base.strip_prefix("middle_block_") {
+        let (n, s) = pop_num(s)?;
+        let rest = s.strip_prefix('_').unwrap_or(s);
+        (sdxl_middle_block(n)?, rest)
+    } else {
+        return None;
+    };
+
+    let unet_path = if rest.is_empty() {
+        block_prefix
+    } else {
+        format!("{block_prefix}.{}", ldm_suffix_to_diffusers(rest))
+    };
+    Some(format!("{unet_path}.weight"))
+}
+
+fn sdxl_input_block(n: usize, m: usize) -> Option<String> {
+    match (n, m) {
+        (1, 0) => Some("down_blocks.0.resnets.0".into()),
+        (2, 0) => Some("down_blocks.0.resnets.1".into()),
+        (4, 0) => Some("down_blocks.1.resnets.0".into()),
+        (4, 1) => Some("down_blocks.1.attentions.0".into()),
+        (5, 0) => Some("down_blocks.1.resnets.1".into()),
+        (5, 1) => Some("down_blocks.1.attentions.1".into()),
+        (7, 0) => Some("down_blocks.2.resnets.0".into()),
+        (7, 1) => Some("down_blocks.2.attentions.0".into()),
+        (8, 0) => Some("down_blocks.2.resnets.1".into()),
+        (8, 1) => Some("down_blocks.2.attentions.1".into()),
+        _ => None,
+    }
+}
+
+fn sdxl_output_block(n: usize, m: usize) -> Option<String> {
+    let (up_block, layer) = match n {
+        0..=2 => (0, n),
+        3..=5 => (1, n - 3),
+        6..=8 => (2, n - 6),
+        _ => return None,
+    };
+    match m {
+        0 => Some(format!("up_blocks.{up_block}.resnets.{layer}")),
+        1 => Some(format!("up_blocks.{up_block}.attentions.{layer}")),
+        _ => None,
+    }
+}
+
+fn sdxl_middle_block(n: usize) -> Option<String> {
+    match n {
+        0 => Some("mid_block.resnets.0".into()),
+        1 => Some("mid_block.attentions.0".into()),
+        2 => Some("mid_block.resnets.1".into()),
+        _ => None,
+    }
+}
+
+/// Converts the module-path portion of an ldm LoRA key to diffusers dot-notation.
+/// e.g. "transformer_blocks_0_attn1_to_out_0" → "transformer_blocks.0.attn1.to_out.0"
+fn ldm_suffix_to_diffusers(s: &str) -> String {
+    // Ordered longest-first to avoid partial matches.
+    const TOKENS: &[(&str, &str)] = &[
+        ("transformer_blocks_", "transformer_blocks"),
+        ("to_out_",             "to_out"),
+        ("ff_net_",             "ff.net"),
+        ("attn1_",              "attn1"),
+        ("attn2_",              "attn2"),
+        ("proj_out",            "proj_out"),
+        ("proj_in",             "proj_in"),
+        ("to_out",              "to_out"),
+        ("to_q",                "to_q"),
+        ("to_k",                "to_k"),
+        ("to_v",                "to_v"),
+        ("norm1",               "norm1"),
+        ("norm2",               "norm2"),
+        ("norm3",               "norm3"),
+    ];
+
+    let mut result = String::new();
+    let mut s = s;
+    while !s.is_empty() {
+        let matched = TOKENS.iter().find_map(|&(ldm, diff)| {
+            s.starts_with(ldm).then(|| {
+                s = &s[ldm.len()..];
+                diff
+            })
+        });
+        match matched {
+            Some(tok) => {
+                if !result.is_empty() { result.push('.'); }
+                result.push_str(tok);
+            }
+            None => {
+                let end = s.find('_').unwrap_or(s.len());
+                if !result.is_empty() { result.push('.'); }
+                result.push_str(&s[..end]);
+                s = if end < s.len() { &s[end + 1..] } else { "" };
+            }
+        }
+    }
+    result
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
