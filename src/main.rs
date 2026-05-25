@@ -303,59 +303,78 @@ fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
         api.repo(hf_hub::Repo::model(name.to_string()))
     };
 
-    // T5 text encoder
-    let t5_emb = {
-        let repo = api.model("mcmonkey/google_t5-v1_1-xxl_encoderonly".to_string());
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[repo.get("model.safetensors")?], dtype, device)?
-        };
-        let config: t5::Config =
-            serde_json::from_str(&std::fs::read_to_string(repo.get("config.json")?)?)?;
-        let mut model = t5::T5EncoderModel::load(vb, &config)?;
-        let tokenizer_file = api
-            .model("lmz/mt5-tokenizers".to_string())
-            .get("t5-v1_1-xxl.tokenizer.json")?;
-        let tokenizer = Tokenizer::from_file(tokenizer_file).map_err(E::msg)?;
-        let mut tokens = tokenizer
-            .encode(args.prompt.as_str(), true)
-            .map_err(E::msg)?
-            .get_ids()
-            .to_vec();
-        tokens.resize(256, 0);
-        let emb = model.forward(&Tensor::new(&tokens[..], device)?.unsqueeze(0)?)?;
-        emb.to_device(&flux_device)?
-    };
-    info!("T5: {:?}", t5_emb.shape());
+    // T5 and CLIP are independent — load and encode in parallel.
+    let (t5_emb, clip_emb) = std::thread::scope(|s| {
+        let t5_handle = s.spawn(|| -> Result<Tensor> {
+            let api = hf_hub::api::sync::Api::new()?;
+            let repo = api.model("mcmonkey/google_t5-v1_1-xxl_encoderonly".to_string());
+            let vb = unsafe {
+                VarBuilder::from_mmaped_safetensors(
+                    &[repo.get("model.safetensors")?],
+                    dtype,
+                    device,
+                )?
+            };
+            let config: t5::Config =
+                serde_json::from_str(&std::fs::read_to_string(repo.get("config.json")?)?)?;
+            let mut model = t5::T5EncoderModel::load(vb, &config)?;
+            let tokenizer_file = api
+                .model("lmz/mt5-tokenizers".to_string())
+                .get("t5-v1_1-xxl.tokenizer.json")?;
+            let tokenizer = Tokenizer::from_file(tokenizer_file).map_err(E::msg)?;
+            let mut tokens = tokenizer
+                .encode(args.prompt.as_str(), true)
+                .map_err(E::msg)?
+                .get_ids()
+                .to_vec();
+            tokens.resize(256, 0);
+            let emb = model.forward(&Tensor::new(&tokens[..], device)?.unsqueeze(0)?)?;
+            Ok(emb.to_device(&flux_device)?)
+        });
 
-    // CLIP pooled embeddings
-    let clip_emb = {
-        let repo = api.repo(hf_hub::Repo::model(
-            "openai/clip-vit-large-patch14".to_string(),
-        ));
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[repo.get("model.safetensors")?], dtype, device)?
-        };
-        let config = clip::text_model::ClipTextConfig {
-            vocab_size: 49408,
-            projection_dim: 768,
-            activation: clip::text_model::Activation::QuickGelu,
-            intermediate_size: 3072,
-            embed_dim: 768,
-            max_position_embeddings: 77,
-            pad_with: None,
-            num_hidden_layers: 12,
-            num_attention_heads: 12,
-        };
-        let model = clip::text_model::ClipTextTransformer::new(vb.pp("text_model"), &config)?;
-        let tokenizer = Tokenizer::from_file(repo.get("tokenizer.json")?).map_err(E::msg)?;
-        let tokens = tokenizer
-            .encode(args.prompt.as_str(), true)
-            .map_err(E::msg)?
-            .get_ids()
-            .to_vec();
-        let emb = model.forward(&Tensor::new(&tokens[..], device)?.unsqueeze(0)?)?;
-        emb.to_device(&flux_device)?
-    };
+        let clip_handle = s.spawn(|| -> Result<Tensor> {
+            let api = hf_hub::api::sync::Api::new()?;
+            let repo = api.repo(hf_hub::Repo::model(
+                "openai/clip-vit-large-patch14".to_string(),
+            ));
+            let vb = unsafe {
+                VarBuilder::from_mmaped_safetensors(
+                    &[repo.get("model.safetensors")?],
+                    dtype,
+                    device,
+                )?
+            };
+            let config = clip::text_model::ClipTextConfig {
+                vocab_size: 49408,
+                projection_dim: 768,
+                activation: clip::text_model::Activation::QuickGelu,
+                intermediate_size: 3072,
+                embed_dim: 768,
+                max_position_embeddings: 77,
+                pad_with: None,
+                num_hidden_layers: 12,
+                num_attention_heads: 12,
+            };
+            let model = clip::text_model::ClipTextTransformer::new(vb.pp("text_model"), &config)?;
+            let tokenizer = Tokenizer::from_file(repo.get("tokenizer.json")?).map_err(E::msg)?;
+            let tokens = tokenizer
+                .encode(args.prompt.as_str(), true)
+                .map_err(E::msg)?
+                .get_ids()
+                .to_vec();
+            let emb = model.forward(&Tensor::new(&tokens[..], device)?.unsqueeze(0)?)?;
+            Ok(emb.to_device(&flux_device)?)
+        });
+
+        let t5_emb = t5_handle
+            .join()
+            .map_err(|e| anyhow::anyhow!("T5 thread panicked: {e:?}"))??;
+        let clip_emb = clip_handle
+            .join()
+            .map_err(|e| anyhow::anyhow!("CLIP thread panicked: {e:?}"))??;
+        Ok::<_, anyhow::Error>((t5_emb, clip_emb))
+    })?;
+    info!("T5: {:?}", t5_emb.shape());
     info!("CLIP: {:?}", clip_emb.shape());
 
     // FLUX DiT
@@ -758,7 +777,11 @@ impl KarrasEulerAScheduler {
         let (all_sigmas, sigma_max, sigma_min) = build_sdxl_sigmas(n_steps);
         let (sigmas, timesteps) = build_karras_schedule(n_steps, &all_sigmas, sigma_max, sigma_min);
         let init_noise_sigma = (sigma_max * sigma_max + 1.0).sqrt();
-        Ok(Self { sigmas, timesteps, init_noise_sigma })
+        Ok(Self {
+            sigmas,
+            timesteps,
+            init_noise_sigma,
+        })
     }
 }
 
@@ -846,7 +869,11 @@ impl Dpm2mKarrasScheduler {
     fn new(n_steps: usize) -> Result<Self> {
         let (all_sigmas, sigma_max, sigma_min) = build_sdxl_sigmas(n_steps);
         let (sigmas, timesteps) = build_karras_schedule(n_steps, &all_sigmas, sigma_max, sigma_min);
-        Ok(Self { sigmas, timesteps, prev_denoised: None })
+        Ok(Self {
+            sigmas,
+            timesteps,
+            prev_denoised: None,
+        })
     }
 }
 
@@ -1147,22 +1174,24 @@ fn apply_te_lora(
 /// e.g. "text_model_encoder_layers_0_self_attn_q_proj" → "text_model.encoder.layers.0.self_attn.q_proj.weight"
 fn te_lora_base_to_weight_key(base: &str) -> Option<String> {
     const TE_TOKENS: &[(&str, &str)] = &[
-        ("text_model_",  "text_model"),
-        ("encoder_",     "encoder"),
-        ("layers_",      "layers"),
-        ("self_attn_",   "self_attn"),
-        ("mlp_",         "mlp"),
-        ("layer_norm1",  "layer_norm1"),
-        ("layer_norm2",  "layer_norm2"),
-        ("out_proj",     "out_proj"),
-        ("q_proj",       "q_proj"),
-        ("k_proj",       "k_proj"),
-        ("v_proj",       "v_proj"),
-        ("fc1",          "fc1"),
-        ("fc2",          "fc2"),
+        ("text_model_", "text_model"),
+        ("encoder_", "encoder"),
+        ("layers_", "layers"),
+        ("self_attn_", "self_attn"),
+        ("mlp_", "mlp"),
+        ("layer_norm1", "layer_norm1"),
+        ("layer_norm2", "layer_norm2"),
+        ("out_proj", "out_proj"),
+        ("q_proj", "q_proj"),
+        ("k_proj", "k_proj"),
+        ("v_proj", "v_proj"),
+        ("fc1", "fc1"),
+        ("fc2", "fc2"),
     ];
     let result = greedy_tokenize(base, TE_TOKENS);
-    if result.is_empty() { return None; }
+    if result.is_empty() {
+        return None;
+    }
     Some(format!("{result}.weight"))
 }
 
@@ -1259,12 +1288,16 @@ fn greedy_tokenize(mut s: &str, tokens: &[(&str, &str)]) -> String {
         });
         match matched {
             Some(tok) => {
-                if !result.is_empty() { result.push('.'); }
+                if !result.is_empty() {
+                    result.push('.');
+                }
                 result.push_str(tok);
             }
             None => {
                 let end = s.find('_').unwrap_or(s.len());
-                if !result.is_empty() { result.push('.'); }
+                if !result.is_empty() {
+                    result.push('.');
+                }
                 result.push_str(&s[..end]);
                 s = if end < s.len() { &s[end + 1..] } else { "" };
             }
