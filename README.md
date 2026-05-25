@@ -25,7 +25,7 @@ Weights are downloaded automatically from HuggingFace Hub on first run and cache
 | FLUX.1-schnell / dev | 32 GB | 64 GB |
 | Araminta (SDXL) | 16 GB | 24 GB |
 
-FLUX loads ~36 GB of weights in total (DiT + T5-XXL + CLIP). On 32 GB machines it will swap during the run.
+FLUX loads ~36 GB of weights in total (DiT + T5-XXL + CLIP) in F32. On 32 GB machines it will swap during the run. Use `--dtype bf16` (default on Metal) to halve memory usage, or `--model schnell-gguf` for ~12 GB.
 
 ## Build
 
@@ -113,7 +113,9 @@ pipe.save_pretrained("/path/to/sdxl-diffusers")
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model` | `schnell` | `schnell` / `dev` / `araminta` |
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--model` | `schnell` | `schnell` / `dev` / `schnell-gguf` / `dev-gguf` / `araminta` |
 | `--prompt` | — | Text prompt |
 | `--uncond-prompt` | `""` | Negative prompt (SDXL only) |
 | `--height` | 768 / 1024 | Output height in pixels |
@@ -127,6 +129,10 @@ pipe.save_pretrained("/path/to/sdxl-diffusers")
 | `--lora` | — | Path to LoRA `.safetensors` (SDXL only) |
 | `--lora-scale` | `1.0` | LoRA strength |
 | `--local-model` | — | Local diffusers model dir (SDXL only, overrides HF download) |
+| `--gguf` | — | Local FLUX GGUF file (skips HF download) |
+| `--quantization` | `q8` | `q8` / `q4` (for schnell-gguf / dev-gguf) |
+| `--dtype` | `bf16` (Metal), `f32` (CPU) | Tensor dtype: `f32`, `bf16`, `f16` |
+| `--vae-cpu` | — | Decode VAE on CPU (slower, less Metal memory) |
 | `--cpu` | — | Force CPU instead of Metal |
 
 ## LoRA format
@@ -145,9 +151,32 @@ LoRA weights are merged into the UNet before inference — no runtime overhead.
 
 ### High swap / slow finish on Apple Silicon
 
-Metal uses an internal memory pool and does not return GPU memory to the OS until the system is under pressure. This is normal behavior — the process may briefly touch swap at the end of a run even after all model weights have been dropped in Rust. There is no workaround within Candle short of patching the Metal allocator.
+Metal uses an internal memory pool and does not return GPU memory to the OS until the system is under pressure. This is normal behavior — the process may briefly touch swap at the end of a run even after all model weights have been dropped in Rust.
 
-To reduce peak memory use a smaller model (`--model araminta`) or pass `--cpu` to skip Metal entirely (much slower but no Metal pool overhead).
+**Reduce memory usage:**
+
+| Technique | Effect |
+|-----------|--------|
+| `--dtype bf16` (default on Metal) | ~2× less memory than F32 |
+| `--model schnell-gguf` / `--model dev-gguf` | ~12 GB instead of ~24 GB |
+| `--vae-cpu` | VAE decode on CPU, avoids Metal pool growth from activations |
+| `--cpu` | Skip Metal entirely (much slower, no pool overhead) |
+| `--model araminta` | Smallest model, ~7 GB |
+
+### GGUF models
+
+Quantized FLUX variants from [city96](https://huggingface.co/city96):
+
+```bash
+./target/release/etch \
+  --model schnell-gguf \
+  --prompt "A rusty robot walking on a beach"
+```
+
+| Flag | Size | Steps | Quality |
+|------|------|-------|---------|
+| `--quantization q8` | ~12 GB | 4 | Best |
+| `--quantization q4` | ~7 GB | 4 | Good |
 
 ### Same face on every image
 

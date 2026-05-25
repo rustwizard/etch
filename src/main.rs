@@ -87,6 +87,33 @@ struct Args {
     /// Quantization level for schnell-gguf / dev-gguf models (default: q8).
     #[arg(long, value_enum, default_value = "q8")]
     quantization: Quantization,
+
+    /// Tensor dtype for model weights (default: bf16 on Metal, f32 on CPU).
+    /// BF16 halves memory vs F32 with negligible quality loss. GGUF ignores this flag.
+    #[arg(long, value_enum)]
+    dtype: Option<DtypeArg>,
+
+    /// Force VAE decode on CPU. Slower (~10–30s on 1024×1024) but avoids the
+    /// Metal pool peak from VAE intermediate activations — useful on tight memory.
+    #[arg(long)]
+    vae_cpu: bool,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
+enum DtypeArg {
+    F32,
+    Bf16,
+    F16,
+}
+
+impl From<DtypeArg> for DType {
+    fn from(d: DtypeArg) -> Self {
+        match d {
+            DtypeArg::F32 => DType::F32,
+            DtypeArg::Bf16 => DType::BF16,
+            DtypeArg::F16 => DType::F16,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq, Default)]
@@ -165,7 +192,10 @@ fn main() -> Result<()> {
         device.set_seed(seed)?;
     }
 
-    let dtype = DType::F32;
+    let dtype: DType = args.dtype.map(DType::from).unwrap_or_else(|| {
+        if matches!(device, Device::Cpu) { DType::F32 } else { DType::BF16 }
+    });
+    info!("Dtype: {:?}", dtype);
 
     let output = args.output.clone().unwrap_or_else(|| {
         let n: u32 = rand::random();
@@ -465,10 +495,13 @@ fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
         unpacked.to_device(device)?
     };
 
-    // VAE decode
+    // VAE decode — always F32 for stable decode regardless of model dtype.
+    // Optionally on CPU to keep Metal pool from growing with intermediate activations.
+    let vae_device = if args.vae_cpu { Device::Cpu } else { device.clone() };
+    let img = img.to_device(&vae_device)?;
     let img = {
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[bf_repo.get("ae.safetensors")?], dtype, device)?
+            VarBuilder::from_mmaped_safetensors(&[bf_repo.get("ae.safetensors")?], DType::F32, &vae_device)?
         };
         let cfg = match args.model {
             Model::Dev | Model::DevGguf => flux::autoencoder::Config::dev(),
@@ -597,11 +630,6 @@ fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     };
     info!("Text embeddings: {:?}", text_embeddings.shape());
 
-    let vae = sd_config.build_vae(
-        model_file("vae/diffusion_pytorch_model.safetensors")?,
-        device,
-        DType::F32,
-    )?;
     let unet = {
         let unet_weights = model_file("unet/diffusion_pytorch_model.safetensors")?;
         if let Some(lora) = &lora_map {
@@ -681,6 +709,15 @@ fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     drop(unet);
     drop(text_embeddings);
 
+    // Load VAE only after UNet inference — avoids 335 MB Metal residency during the loop.
+    // Optionally on CPU to keep Metal pool from growing with intermediate activations.
+    let vae_device = if args.vae_cpu { Device::Cpu } else { device.clone() };
+    let vae = sd_config.build_vae(
+        model_file("vae/diffusion_pytorch_model.safetensors")?,
+        &vae_device,
+        DType::F32,
+    )?;
+    let latents = latents.to_device(&vae_device)?;
     let img = vae.decode(&(latents.to_dtype(DType::F32)? / vae_scale)?)?;
     drop(vae);
     let img = img.to_device(&Device::Cpu)?;
@@ -1007,9 +1044,9 @@ fn sdxl_clip_emb(
         if applied > 0 {
             info!("TE LoRA ({te_prefix}): applied to {applied} layers");
         }
-        VarBuilder::from_tensors(patched, DType::F32, ctx.device)
+        VarBuilder::from_tensors(patched, ctx.dtype, ctx.device)
     } else {
-        unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, ctx.device)? }
+        unsafe { VarBuilder::from_mmaped_safetensors(&[weights], ctx.dtype, ctx.device)? }
     };
     let model = stable_diffusion::clip::ClipTextTransformer::new(vb, clip_config)?;
 
