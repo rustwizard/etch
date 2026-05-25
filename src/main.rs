@@ -15,6 +15,7 @@ use candle_core::{D, DType, Device, IndexOp, Module, Tensor};
 use candle_nn::VarBuilder;
 use clap::Parser;
 use tokenizers::Tokenizer;
+use tracing::info;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -124,22 +125,31 @@ enum Model {
 }
 
 fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .without_time()
+        .with_target(false)
+        .init();
+
     let args = Args::parse();
 
     let device = if args.cpu {
         Device::Cpu
     } else {
         #[cfg(feature = "metal")]
-        { Device::new_metal(0).unwrap_or_else(|e| { eprintln!("Metal init failed: {e}. Falling back to CPU."); Device::Cpu }) }
+        { Device::new_metal(0).unwrap_or_else(|e| { tracing::warn!("Metal init failed: {e}. Falling back to CPU."); Device::Cpu }) }
         #[cfg(all(feature = "cuda", not(feature = "metal")))]
-        { Device::new_cuda(0).unwrap_or_else(|e| { eprintln!("CUDA init failed: {e}. Falling back to CPU."); Device::Cpu }) }
+        { Device::new_cuda(0).unwrap_or_else(|e| { tracing::warn!("CUDA init failed: {e}. Falling back to CPU."); Device::Cpu }) }
         #[cfg(not(any(feature = "metal", feature = "cuda")))]
         { Device::Cpu }
     };
-    println!("Device: {:?}", device);
+    info!("Device: {:?}", device);
 
     let seed = args.seed.unwrap_or_else(rand::random);
-    println!("Seed: {seed}");
+    info!("Seed: {seed}");
     if !matches!(device, Device::Cpu) {
         device.set_seed(seed)?;
     }
@@ -162,7 +172,7 @@ fn main() -> Result<()> {
         Model::Schnell | Model::Dev | Model::SchnellGguf | Model::DevGguf => run_flux(&args, &device, dtype)?,
         Model::Araminta => run_sdxl(&args, &device, dtype)?,
     }
-    println!("Total time: {:.1}s", t0.elapsed().as_secs_f32());
+    info!("Total time: {:.1}s", t0.elapsed().as_secs_f32());
 
     let out_path = args.output.as_deref().expect("output set above");
     let log_path = std::path::Path::new(out_path)
@@ -195,8 +205,8 @@ fn main() -> Result<()> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 enum FluxModel {
-    Full(flux::model::Flux),
-    Quantized(flux::quantized_model::Flux),
+    Full(Box<flux::model::Flux>),
+    Quantized(Box<flux::quantized_model::Flux>),
 }
 
 impl flux::WithForward for FluxModel {
@@ -294,7 +304,7 @@ fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
         let emb = model.forward(&Tensor::new(&tokens[..], device)?.unsqueeze(0)?)?;
         emb.to_device(&flux_device)?
     };
-    println!("T5: {:?}", t5_emb.shape());
+    info!("T5: {:?}", t5_emb.shape());
 
     // CLIP pooled embeddings
     let clip_emb = {
@@ -325,7 +335,7 @@ fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
         let emb = model.forward(&Tensor::new(&tokens[..], device)?.unsqueeze(0)?)?;
         emb.to_device(&flux_device)?
     };
-    println!("CLIP: {:?}", clip_emb.shape());
+    info!("CLIP: {:?}", clip_emb.shape());
 
     // FLUX DiT
     let img = {
@@ -347,7 +357,7 @@ fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
         };
         let model = if let Some(gguf_path) = &args.gguf {
             let vb = load_gguf_with_spinner(gguf_path, gguf_path, device)?;
-            FluxModel::Quantized(flux::quantized_model::Flux::new(&cfg, vb)?)
+            FluxModel::Quantized(Box::new(flux::quantized_model::Flux::new(&cfg, vb)?))
         } else if matches!(args.model, Model::SchnellGguf | Model::DevGguf) {
             let q = match args.quantization {
                 Quantization::Q8 => "Q8_0",
@@ -360,14 +370,14 @@ fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             let gguf_file = gguf_file.as_str();
             let path = api.repo(hf_hub::Repo::model(gguf_repo.to_string())).get(gguf_file)?;
             let vb = load_gguf_with_spinner(&path, gguf_file, device)?;
-            FluxModel::Quantized(flux::quantized_model::Flux::new(&cfg, vb)?)
+            FluxModel::Quantized(Box::new(flux::quantized_model::Flux::new(&cfg, vb)?))
         } else {
             let model_file = match args.model {
                 Model::Dev => bf_repo.get("flux1-dev.safetensors")?,
                 _ => bf_repo.get("flux1-schnell.safetensors")?,
             };
             let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[model_file], dtype, device)? };
-            FluxModel::Full(flux::model::Flux::new(&cfg, vb)?)
+            FluxModel::Full(Box::new(flux::model::Flux::new(&cfg, vb)?))
         };
         let denoised = {
             let n_steps = timesteps.len().saturating_sub(1);
@@ -415,7 +425,7 @@ fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     let img = ((img.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
     let out = args.output.as_deref().expect("output set in main");
     save_image(&img.i(0)?, out)?;
-    println!("Saved to {out}");
+    info!("Saved to {out}");
     Ok(())
 }
 
@@ -450,7 +460,7 @@ fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
         stable_diffusion::StableDiffusionConfig::sdxl(None, Some(height), Some(width));
     let mut scheduler: Box<dyn Scheduler> = match args.scheduler {
         SamplerType::EulerA => {
-            println!("Scheduler: Euler Ancestral");
+            info!("Scheduler: Euler Ancestral");
             Box::new(EulerAncestralDiscreteScheduler::new(
                 n_steps,
                 EulerAncestralDiscreteSchedulerConfig {
@@ -460,11 +470,11 @@ fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             )?)
         }
         SamplerType::EulerAKarras => {
-            println!("Scheduler: Euler Ancestral + Karras");
+            info!("Scheduler: Euler Ancestral + Karras");
             Box::new(KarrasEulerAScheduler::new(n_steps)?)
         }
         SamplerType::Dpm2mKarras => {
-            println!("Scheduler: DPM++ 2M Karras");
+            info!("Scheduler: DPM++ 2M Karras");
             Box::new(Dpm2mKarrasScheduler::new(n_steps)?)
         }
     };
@@ -517,7 +527,7 @@ fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
         // [batch, 77, 768] ++ [batch, 77, 1280] → [batch, 77, 2048]
         Tensor::cat(&[emb1, emb2], D::Minus1)?
     };
-    println!("Text embeddings: {:?}", text_embeddings.shape());
+    info!("Text embeddings: {:?}", text_embeddings.shape());
 
     let vae = sd_config.build_vae(
         model_file("vae/diffusion_pytorch_model.safetensors")?,
@@ -527,7 +537,7 @@ fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     let unet = {
         let unet_weights = model_file("unet/diffusion_pytorch_model.safetensors")?;
         if let Some(lora_path) = &args.lora {
-            println!("Applying LoRA: {lora_path} (scale {})", args.lora_scale);
+            info!("Applying LoRA: {lora_path} (scale {})", args.lora_scale);
             let mut tensors = candle_core::safetensors::load(&unet_weights, &Device::Cpu)?;
             tensors = apply_lora(tensors, lora_path, args.lora_scale, &Device::Cpu)?;
             let vb = VarBuilder::from_tensors(tensors, dtype, device);
@@ -608,7 +618,7 @@ fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     let img = (img * 255.)?.to_dtype(DType::U8)?;
     let out = args.output.as_deref().expect("output set in main");
     save_image(&img.i(0)?, out)?;
-    println!("Saved to {out}");
+    info!("Saved to {out}");
     Ok(())
 }
 
@@ -981,7 +991,7 @@ fn apply_lora(
         let sample: Vec<_> = lora.keys().take(5).collect();
         anyhow::bail!("LoRA matched 0 UNet layers.\nFirst keys in file: {sample:?}");
     }
-    println!("LoRA applied to {applied} layers");
+    info!("LoRA applied to {applied} layers");
     Ok(tensors)
 }
 
@@ -1140,11 +1150,9 @@ fn ldm_suffix_to_diffusers(s: &str) -> String {
 fn save_image(img: &Tensor, path: &str) -> Result<()> {
     let abs = std::env::current_dir().unwrap_or_default().join(path);
     let path = abs.as_path();
-    println!("Saving image to: {}", path.display());
     let (_c, h, w) = img.dims3()?;
-    // Single flat allocation (~3MB) instead of 1M Vec<u8> objects from to_vec2
     let pixels = img.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
     image::save_buffer(path, &pixels, w as u32, h as u32, image::ColorType::Rgb8)?;
-    println!("Saved: {}", path.display());
+    info!("Saved: {}", path.display());
     Ok(())
 }
