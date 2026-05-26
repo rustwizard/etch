@@ -17,7 +17,7 @@ use clap::Parser;
 use tokenizers::Tokenizer;
 use tracing::info;
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     #[arg(long, default_value = "A rusty robot walking on a beach")]
@@ -42,6 +42,10 @@ struct Args {
 
     #[arg(long)]
     seed: Option<u64>,
+
+    /// Generate a batch of images with seeds in range [start,end], e.g. 0-100
+    #[arg(long, value_name = "START-END")]
+    seed_range: Option<String>,
 
     #[arg(long)]
     output: Option<String>,
@@ -150,6 +154,45 @@ enum Model {
     Araminta,
 }
 
+fn parse_seed_range(s: &str) -> Result<Vec<u64>> {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 2 {
+        anyhow::bail!("seed-range must be in format START-END, e.g. 0-100");
+    }
+    let start: u64 = parts[0]
+        .parse()
+        .map_err(|_| anyhow::anyhow!("seed-range start must be a number"))?;
+    let end: u64 = parts[1]
+        .parse()
+        .map_err(|_| anyhow::anyhow!("seed-range end must be a number"))?;
+    if end < start {
+        anyhow::bail!("seed-range end must be >= start");
+    }
+    Ok((start..=end).collect())
+}
+
+fn output_for_seed(base: &Option<String>, seed: u64) -> String {
+    match base {
+        Some(path) => {
+            let p = std::path::Path::new(path);
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
+            let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("png");
+            let dir = p
+                .parent()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty());
+            match dir {
+                Some(d) => format!("{d}/{stem}-{seed}.{ext}"),
+                None => format!("{stem}-{seed}.{ext}"),
+            }
+        }
+        None => {
+            let n: u32 = rand::random();
+            format!("out/out-{seed}-{n}.png")
+        }
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -186,65 +229,82 @@ fn main() -> Result<()> {
     };
     info!("Device: {:?}", device);
 
-    let seed = args.seed.unwrap_or_else(rand::random);
-    info!("Seed: {seed}");
-    if !matches!(device, Device::Cpu) {
-        device.set_seed(seed)?;
-    }
+    let seeds = if let Some(ref range_str) = args.seed_range {
+        parse_seed_range(range_str)?
+    } else {
+        vec![args.seed.unwrap_or_else(rand::random)]
+    };
+    info!("Generating {} image(s)", seeds.len());
 
     let dtype: DType = args.dtype.map(DType::from).unwrap_or_else(|| {
-        if matches!(device, Device::Cpu) { DType::F32 } else { DType::BF16 }
+        if matches!(device, Device::Cpu) {
+            DType::F32
+        } else {
+            DType::BF16
+        }
     });
     info!("Dtype: {:?}", dtype);
 
-    let output = args.output.clone().unwrap_or_else(|| {
-        let n: u32 = rand::random();
-        format!("out/out-{seed}-{n}.png")
-    });
-    if let Some(parent) = std::path::Path::new(&output).parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    let args = Args {
-        output: Some(output),
-        ..args
-    };
-
-    let t0 = std::time::Instant::now();
-    match args.model {
-        Model::Schnell | Model::Dev | Model::SchnellGguf | Model::DevGguf => {
-            run_flux(&args, &device, dtype)?
+    for seed in seeds {
+        info!("--- Seed: {seed} ---");
+        if !matches!(device, Device::Cpu) {
+            if let Err(e) = device.set_seed(seed) {
+                tracing::warn!("Failed to set seed {seed}: {e}");
+            }
         }
-        Model::Araminta => run_sdxl(&args, &device, dtype)?,
-    }
-    info!("Total time: {:.1}s", t0.elapsed().as_secs_f32());
 
-    let out_path = args.output.as_deref().expect("output set above");
-    let log_path = std::path::Path::new(out_path)
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .join("log.jsonl");
-    let mut entry = serde_json::json!({
-        "file": out_path,
-        "seed": seed,
-        "prompt": args.prompt,
-        "model": format!("{:?}", args.model).to_lowercase(),
-        "steps": args.n_steps,
-    });
-    if args.model == Model::Araminta {
-        entry["scheduler"] = serde_json::json!(format!("{:?}", args.scheduler).to_lowercase());
-        entry["guidance_scale"] = serde_json::json!(args.guidance_scale);
-        if !args.uncond_prompt.is_empty() {
-            entry["uncond_prompt"] = serde_json::json!(args.uncond_prompt);
+        let output = output_for_seed(&args.output, seed);
+        if let Some(parent) = std::path::Path::new(&output).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
+        let iter_args = Args {
+            seed: Some(seed),
+            output: Some(output),
+            ..args.clone()
+        };
+
+        let t0 = std::time::Instant::now();
+        let result = match iter_args.model {
+            Model::Schnell | Model::Dev | Model::SchnellGguf | Model::DevGguf => {
+                run_flux(&iter_args, &device, dtype)
+            }
+            Model::Araminta => run_sdxl(&iter_args, &device, dtype),
+        };
+        if let Err(e) = result {
+            tracing::error!("Seed {seed} failed: {e}");
+            continue;
+        }
+        info!("Total time: {:.1}s", t0.elapsed().as_secs_f32());
+
+        let out_path = iter_args.output.as_deref().expect("output set above");
+        let log_path = std::path::Path::new(out_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("log.jsonl");
+        let mut entry = serde_json::json!({
+            "file": out_path,
+            "seed": seed,
+            "prompt": iter_args.prompt,
+            "model": format!("{:?}", iter_args.model).to_lowercase(),
+            "steps": iter_args.n_steps,
+        });
+        if iter_args.model == Model::Araminta {
+            entry["scheduler"] =
+                serde_json::json!(format!("{:?}", iter_args.scheduler).to_lowercase());
+            entry["guidance_scale"] = serde_json::json!(iter_args.guidance_scale);
+            if !iter_args.uncond_prompt.is_empty() {
+                entry["uncond_prompt"] = serde_json::json!(iter_args.uncond_prompt);
+            }
+        }
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        use std::io::Write as _;
+        writeln!(log, "{}", entry)?;
     }
-    let mut log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
-    use std::io::Write as _;
-    writeln!(log, "{}", entry)?;
 
     Ok(())
 }
@@ -497,11 +557,19 @@ fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
 
     // VAE decode — always F32 for stable decode regardless of model dtype.
     // Optionally on CPU to keep Metal pool from growing with intermediate activations.
-    let vae_device = if args.vae_cpu { Device::Cpu } else { device.clone() };
+    let vae_device = if args.vae_cpu {
+        Device::Cpu
+    } else {
+        device.clone()
+    };
     let img = img.to_device(&vae_device)?;
     let img = {
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[bf_repo.get("ae.safetensors")?], DType::F32, &vae_device)?
+            VarBuilder::from_mmaped_safetensors(
+                &[bf_repo.get("ae.safetensors")?],
+                DType::F32,
+                &vae_device,
+            )?
         };
         let cfg = match args.model {
             Model::Dev | Model::DevGguf => flux::autoencoder::Config::dev(),
@@ -711,7 +779,11 @@ fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
 
     // Load VAE only after UNet inference — avoids 335 MB Metal residency during the loop.
     // Optionally on CPU to keep Metal pool from growing with intermediate activations.
-    let vae_device = if args.vae_cpu { Device::Cpu } else { device.clone() };
+    let vae_device = if args.vae_cpu {
+        Device::Cpu
+    } else {
+        device.clone()
+    };
     let vae = sd_config.build_vae(
         model_file("vae/diffusion_pytorch_model.safetensors")?,
         &vae_device,
