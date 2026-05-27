@@ -4,6 +4,7 @@ mod cli;
 mod device;
 mod image;
 mod lora;
+mod logger;
 mod schedulers;
 
 use cli::{Args, Model, Quantization, SamplerType};
@@ -91,31 +92,7 @@ fn main() -> Result<()> {
         info!("Total time: {:.1}s", t0.elapsed().as_secs_f32());
 
         let out_path = iter_args.output.as_deref().expect("output set above");
-        let log_path = std::path::Path::new(out_path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .join("log.jsonl");
-        let mut entry = serde_json::json!({
-            "file": out_path,
-            "seed": seed,
-            "prompt": iter_args.prompt,
-            "model": format!("{:?}", iter_args.model).to_lowercase(),
-            "steps": iter_args.n_steps,
-        });
-        if iter_args.model == Model::Araminta {
-            entry["scheduler"] =
-                serde_json::json!(format!("{:?}", iter_args.scheduler).to_lowercase());
-            entry["guidance_scale"] = serde_json::json!(iter_args.guidance_scale);
-            if !iter_args.uncond_prompt.is_empty() {
-                entry["uncond_prompt"] = serde_json::json!(iter_args.uncond_prompt);
-            }
-        }
-        let mut log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)?;
-        use std::io::Write as _;
-        writeln!(log, "{}", entry)?;
+        logger::write_log_entry(out_path, &iter_args, seed)?;
     }
 
     Ok(())
