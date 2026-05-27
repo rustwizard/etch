@@ -1,6 +1,7 @@
 #![deny(clippy::unwrap_used)]
 
 mod cli;
+mod device;
 
 use cli::{Args, Model, Quantization, SamplerType};
 
@@ -33,28 +34,7 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let device = if args.cpu {
-        Device::Cpu
-    } else {
-        #[cfg(feature = "metal")]
-        {
-            Device::new_metal(0).unwrap_or_else(|e| {
-                tracing::warn!("Metal init failed: {e}. Falling back to CPU.");
-                Device::Cpu
-            })
-        }
-        #[cfg(all(feature = "cuda", not(feature = "metal")))]
-        {
-            Device::new_cuda(0).unwrap_or_else(|e| {
-                tracing::warn!("CUDA init failed: {e}. Falling back to CPU.");
-                Device::Cpu
-            })
-        }
-        #[cfg(not(any(feature = "metal", feature = "cuda")))]
-        {
-            Device::Cpu
-        }
-    };
+    let device = device::pick_device(args.cpu);
     info!("Device: {:?}", device);
 
     let seeds = if let Some(ref range_str) = args.seed_range {
