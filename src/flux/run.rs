@@ -22,6 +22,8 @@ pub fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     // embeddings are moved to CPU before FLUX inference.
     let is_gguf = args.gguf.is_some() || matches!(args.model, Model::SchnellGguf | Model::DevGguf);
     let flux_device = if is_gguf { Device::Cpu } else { device.clone() };
+    // GGUF weights dequantize to F32; mixing BF16 tensors with F32 weights fails in matmul.
+    let dtype = if is_gguf { DType::F32 } else { dtype };
 
     let bf_repo = {
         let name = match args.model {
