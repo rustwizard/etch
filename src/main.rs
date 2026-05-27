@@ -4,8 +4,8 @@ mod cli;
 mod device;
 mod flux;
 mod image;
-mod lora;
 mod logger;
+mod lora;
 mod schedulers;
 mod sdxl;
 
@@ -49,10 +49,10 @@ fn main() -> Result<()> {
 
     for seed in seeds {
         info!("--- Seed: {seed} ---");
-        if !matches!(device, Device::Cpu) {
-            if let Err(e) = device.set_seed(seed) {
-                tracing::warn!("Failed to set seed {seed}: {e}");
-            }
+        if !matches!(device, Device::Cpu)
+            && let Err(e) = device.set_seed(seed)
+        {
+            tracing::warn!("Failed to set seed {seed}: {e}");
         }
 
         let output = cli::output_for_seed(&args.output, seed);
@@ -86,5 +86,3 @@ fn main() -> Result<()> {
 
     Ok(())
 }
-
-
