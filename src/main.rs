@@ -2,6 +2,7 @@
 
 mod cli;
 mod device;
+mod image;
 
 use cli::{Args, Model, Quantization, SamplerType};
 
@@ -389,7 +390,7 @@ fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     let img = img.to_device(&Device::Cpu)?;
     let img = ((img.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
     let out = args.output.as_deref().expect("output set in main");
-    save_image(&img.i(0)?, out)?;
+    image::save_image(&img.i(0)?, out)?;
     info!("Saved to {out}");
     Ok(())
 }
@@ -604,7 +605,7 @@ fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     let img = ((img / 2.)? + 0.5)?.clamp(0f32, 1f32)?;
     let img = (img * 255.)?.to_dtype(DType::U8)?;
     let out = args.output.as_deref().expect("output set in main");
-    save_image(&img.i(0)?, out)?;
+    image::save_image(&img.i(0)?, out)?;
     info!("Saved to {out}");
     Ok(())
 }
@@ -1245,16 +1246,3 @@ fn ldm_suffix_to_diffusers(s: &str) -> String {
     greedy_tokenize(s, TOKENS)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Image saving
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn save_image(img: &Tensor, path: &str) -> Result<()> {
-    let abs = std::env::current_dir().unwrap_or_default().join(path);
-    let path = abs.as_path();
-    let (_c, h, w) = img.dims3()?;
-    let pixels = img.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
-    image::save_buffer(path, &pixels, w as u32, h as u32, image::ColorType::Rgb8)?;
-    info!("Saved: {}", path.display());
-    Ok(())
-}
