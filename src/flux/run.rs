@@ -13,6 +13,8 @@ use super::model::FluxModel;
 pub fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     let height = args.height.unwrap_or(768);
     let width = args.width.unwrap_or(1360);
+    anyhow::ensure!(height % 16 == 0, "--height must be a multiple of 16, got {height}");
+    anyhow::ensure!(width % 16 == 0, "--width must be a multiple of 16, got {width}");
     let api = hf_hub::api::sync::Api::new()?;
 
     // GGUF weights live in CPU RAM; run the entire DiT on CPU to avoid device
