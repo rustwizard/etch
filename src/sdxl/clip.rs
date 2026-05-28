@@ -51,6 +51,7 @@ pub(crate) fn sdxl_clip_emb(
         }
         VarBuilder::from_tensors(patched, ctx.dtype, ctx.device)
     } else {
+        // SAFETY: file is owned by the HF cache or local model dir and not modified during inference.
         unsafe { VarBuilder::from_mmaped_safetensors(&[weights], ctx.dtype, ctx.device)? }
     };
     let model = stable_diffusion::clip::ClipTextTransformer::new(vb, clip_config)?;

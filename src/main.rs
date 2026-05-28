@@ -17,24 +17,27 @@ use clap::Parser;
 use tracing::info;
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .without_time()
-        .with_target(false)
-        .init();
-
     let args = Args::parse();
+
+    let builder = tracing_subscriber::fmt().with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+    );
+    if args.verbose {
+        builder.init();
+    } else {
+        builder.without_time().with_target(false).init();
+    }
 
     let device = device::pick_device(args.cpu);
     info!("Device: {:?}", device);
 
-    let seeds = if let Some(ref range_str) = args.seed_range {
-        cli::parse_seed_range(range_str)?
+    let (seeds, seed_source) = if let Some(ref range_str) = args.seed_range {
+        (cli::parse_seed_range(range_str)?, "range")
+    } else if args.seed.is_some() {
+        (vec![args.seed.unwrap_or_else(rand::random)], "explicit")
     } else {
-        vec![args.seed.unwrap_or_else(rand::random)]
+        (vec![rand::random::<u64>()], "auto")
     };
     info!("Generating {} image(s)", seeds.len());
 
@@ -48,7 +51,7 @@ fn main() -> Result<()> {
     info!("Dtype: {:?}", dtype);
 
     for seed in seeds {
-        info!("--- Seed: {seed} ---");
+        info!("--- Seed: {seed} ({seed_source}) ---");
         if let Err(e) = device.set_seed(seed) {
             tracing::warn!("Failed to set seed {seed}: {e}");
         }
@@ -72,13 +75,13 @@ fn main() -> Result<()> {
             }
             Model::Araminta => sdxl::run_sdxl(&iter_args, &device, dtype),
         };
+        let out_path = iter_args.output.as_deref().expect("output set above");
         if let Err(e) = result {
             tracing::error!("Seed {seed} failed: {e}");
+            let _ = logger::write_log_failure(out_path, &iter_args, seed, &e);
             continue;
         }
         info!("Total time: {:.1}s", t0.elapsed().as_secs_f32());
-
-        let out_path = iter_args.output.as_deref().expect("output set above");
         logger::write_log_entry(out_path, &iter_args, seed)?;
     }
 
