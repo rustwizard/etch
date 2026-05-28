@@ -13,6 +13,8 @@ use super::model::FluxModel;
 pub fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     let height = args.height.unwrap_or(768);
     let width = args.width.unwrap_or(1360);
+    anyhow::ensure!(height % 16 == 0, "--height must be a multiple of 16, got {height}");
+    anyhow::ensure!(width % 16 == 0, "--width must be a multiple of 16, got {width}");
     let api = hf_hub::api::sync::Api::new()?;
 
     // GGUF weights live in CPU RAM; run the entire DiT on CPU to avoid device
@@ -157,7 +159,17 @@ pub fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
         let denoised = {
             let n_steps = timesteps.len().saturating_sub(1);
             let b_sz = state.img.dim(0)?;
-            let guidance = Tensor::full(4f32, b_sz, &flux_device)?;
+            // schnell is a distilled model — guidance embedding is absent from its weights.
+            // dev has guidance conditioning; a separate CLI flag keeps it from clashing
+            // with --guidance-scale (SDXL) which uses a very different scale (7.5 vs 3.5).
+            let guidance = match args.model {
+                Model::Schnell | Model::SchnellGguf => None,
+                _ => Some(Tensor::full(
+                    args.flux_guidance as f32,
+                    b_sz,
+                    &flux_device,
+                )?),
+            };
             let mut img = state.img.clone();
             let loop_start = std::time::Instant::now();
             for (i, window) in timesteps.windows(2).enumerate() {
@@ -172,7 +184,7 @@ pub fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
                     &state.txt_ids,
                     &t_vec,
                     &state.vec,
-                    Some(&guidance),
+                    guidance.as_ref(),
                 )?;
                 img = (img + (pred * (t_prev - t_curr))?)?;
                 let step_secs = step_start.elapsed().as_secs_f32();

@@ -49,9 +49,7 @@ fn main() -> Result<()> {
 
     for seed in seeds {
         info!("--- Seed: {seed} ---");
-        if !matches!(device, Device::Cpu)
-            && let Err(e) = device.set_seed(seed)
-        {
+        if let Err(e) = device.set_seed(seed) {
             tracing::warn!("Failed to set seed {seed}: {e}");
         }
 
