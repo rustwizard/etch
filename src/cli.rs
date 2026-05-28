@@ -85,6 +85,11 @@ pub struct Args {
     /// Metal pool peak from VAE intermediate activations — useful on tight memory.
     #[arg(long)]
     pub vae_cpu: bool,
+
+    /// Guidance scale for FLUX.1-dev (ignored for schnell, which is distilled and needs no guidance).
+    /// Typical range 1.0–5.0. Default: 3.5.
+    #[arg(long, default_value_t = 3.5)]
+    pub flux_guidance: f64,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
