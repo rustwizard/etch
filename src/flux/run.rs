@@ -13,8 +13,14 @@ use super::model::FluxModel;
 pub fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     let height = args.height.unwrap_or(768);
     let width = args.width.unwrap_or(1360);
-    anyhow::ensure!(height.is_multiple_of(16), "--height must be a multiple of 16, got {height}");
-    anyhow::ensure!(width.is_multiple_of(16), "--width must be a multiple of 16, got {width}");
+    anyhow::ensure!(
+        height.is_multiple_of(16),
+        "--height must be a multiple of 16, got {height}"
+    );
+    anyhow::ensure!(
+        width.is_multiple_of(16),
+        "--width must be a multiple of 16, got {width}"
+    );
     let api = hf_hub::api::sync::Api::new()?;
 
     // GGUF weights live in CPU RAM; run the entire DiT on CPU to avoid device
@@ -167,11 +173,7 @@ pub fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             // with --guidance-scale (SDXL) which uses a very different scale (7.5 vs 3.5).
             let guidance = match args.model {
                 Model::Schnell | Model::SchnellGguf => None,
-                _ => Some(Tensor::full(
-                    args.flux_guidance as f32,
-                    b_sz,
-                    &flux_device,
-                )?),
+                _ => Some(Tensor::full(args.flux_guidance as f32, b_sz, &flux_device)?),
             };
             let mut img = state.img.clone();
             let loop_start = std::time::Instant::now();

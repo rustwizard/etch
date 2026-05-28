@@ -5,7 +5,12 @@ pub fn write_log_entry(out_path: &str, args: &Args, seed: u64) -> Result<()> {
     write_entry(out_path, args, seed, None)
 }
 
-pub fn write_log_failure(out_path: &str, args: &Args, seed: u64, err: &anyhow::Error) -> Result<()> {
+pub fn write_log_failure(
+    out_path: &str,
+    args: &Args,
+    seed: u64,
+    err: &anyhow::Error,
+) -> Result<()> {
     write_entry(out_path, args, seed, Some(err))
 }
 
@@ -26,8 +31,7 @@ fn write_entry(out_path: &str, args: &Args, seed: u64, err: Option<&anyhow::Erro
         entry["error"] = serde_json::json!(format!("{e:#}"));
     }
     if args.model == Model::Araminta {
-        entry["scheduler"] =
-            serde_json::json!(format!("{:?}", args.scheduler).to_lowercase());
+        entry["scheduler"] = serde_json::json!(format!("{:?}", args.scheduler).to_lowercase());
         entry["guidance_scale"] = serde_json::json!(args.guidance_scale);
         if !args.uncond_prompt.is_empty() {
             entry["uncond_prompt"] = serde_json::json!(args.uncond_prompt);

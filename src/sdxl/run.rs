@@ -15,13 +15,19 @@ use candle_transformers::models::stable_diffusion::{
 use tokenizers::Tokenizer;
 use tracing::info;
 
-use super::clip::{sdxl_clip_emb, ClipEmbedCtx};
+use super::clip::{ClipEmbedCtx, sdxl_clip_emb};
 
 pub fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     let height = args.height.unwrap_or(768);
     let width = args.width.unwrap_or(1024);
-    anyhow::ensure!(height.is_multiple_of(8), "--height must be a multiple of 8, got {height}");
-    anyhow::ensure!(width.is_multiple_of(8), "--width must be a multiple of 8, got {width}");
+    anyhow::ensure!(
+        height.is_multiple_of(8),
+        "--height must be a multiple of 8, got {height}"
+    );
+    anyhow::ensure!(
+        width.is_multiple_of(8),
+        "--width must be a multiple of 8, got {width}"
+    );
     let n_steps = args.n_steps.unwrap_or(20);
     let guidance_scale = args.guidance_scale;
     let use_guide_scale = guidance_scale > 1.0;
