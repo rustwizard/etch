@@ -90,6 +90,10 @@ pub struct Args {
     /// Typical range 1.0–5.0. Default: 3.5.
     #[arg(long, default_value_t = 3.5)]
     pub flux_guidance: f64,
+
+    /// Enable verbose logging: show timestamps and module targets.
+    #[arg(long)]
+    pub verbose: bool,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]

@@ -7,14 +7,14 @@ use candle_transformers::models::{clip, flux, t5};
 use tokenizers::Tokenizer;
 use tracing::info;
 
-use super::gguf::load_gguf_with_spinner;
+use super::gguf::load_gguf;
 use super::model::FluxModel;
 
 pub fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     let height = args.height.unwrap_or(768);
     let width = args.width.unwrap_or(1360);
-    anyhow::ensure!(height % 16 == 0, "--height must be a multiple of 16, got {height}");
-    anyhow::ensure!(width % 16 == 0, "--width must be a multiple of 16, got {width}");
+    anyhow::ensure!(height.is_multiple_of(16), "--height must be a multiple of 16, got {height}");
+    anyhow::ensure!(width.is_multiple_of(16), "--width must be a multiple of 16, got {width}");
     let api = hf_hub::api::sync::Api::new()?;
 
     // GGUF weights live in CPU RAM; run the entire DiT on CPU to avoid device
@@ -40,6 +40,7 @@ pub fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
         let t5_handle = s.spawn(|| -> Result<Tensor> {
             let api = hf_hub::api::sync::Api::new()?;
             let repo = api.model("mcmonkey/google_t5-v1_1-xxl_encoderonly".to_string());
+            // SAFETY: file is owned by the HF cache and not modified during inference.
             let vb = unsafe {
                 VarBuilder::from_mmaped_safetensors(
                     &[repo.get("model.safetensors")?],
@@ -69,6 +70,7 @@ pub fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             let repo = api.repo(hf_hub::Repo::model(
                 "openai/clip-vit-large-patch14".to_string(),
             ));
+            // SAFETY: file is owned by the HF cache and not modified during inference.
             let vb = unsafe {
                 VarBuilder::from_mmaped_safetensors(
                     &[repo.get("model.safetensors")?],
@@ -128,7 +130,7 @@ pub fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             _ => flux::sampling::get_schedule(n_steps, None),
         };
         let model = if let Some(gguf_path) = &args.gguf {
-            let vb = load_gguf_with_spinner(gguf_path, gguf_path, device)?;
+            let vb = load_gguf(gguf_path, gguf_path)?;
             FluxModel::Quantized(Box::new(flux::quantized_model::Flux::new(&cfg, vb)?))
         } else if matches!(args.model, Model::SchnellGguf | Model::DevGguf) {
             let q = match args.quantization {
@@ -146,13 +148,14 @@ pub fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             let path = api
                 .repo(hf_hub::Repo::model(gguf_repo.to_string()))
                 .get(gguf_file)?;
-            let vb = load_gguf_with_spinner(&path, gguf_file, device)?;
+            let vb = load_gguf(&path, gguf_file)?;
             FluxModel::Quantized(Box::new(flux::quantized_model::Flux::new(&cfg, vb)?))
         } else {
             let model_file = match args.model {
                 Model::Dev => bf_repo.get("flux1-dev.safetensors")?,
                 _ => bf_repo.get("flux1-schnell.safetensors")?,
             };
+            // SAFETY: file is owned by the HF cache and not modified during inference.
             let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[model_file], dtype, device)? };
             FluxModel::Full(Box::new(flux::model::Flux::new(&cfg, vb)?))
         };
@@ -216,6 +219,7 @@ pub fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     };
     let img = img.to_device(&vae_device)?;
     let img = {
+        // SAFETY: file is owned by the HF cache and not modified during inference.
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(
                 &[bf_repo.get("ae.safetensors")?],
