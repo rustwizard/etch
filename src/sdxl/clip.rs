@@ -1,6 +1,6 @@
 use crate::lora;
 use anyhow::{Error as E, Result};
-use candle_core::{Device, DType, Module, Tensor};
+use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::stable_diffusion;
 use std::collections::HashMap;
