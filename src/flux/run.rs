@@ -207,6 +207,8 @@ fn run_flux_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             img
         };
         let unpacked = flux::sampling::unpack(&denoised, height, width)?;
+        drop(model);
+        drop(state);
         unpacked.to_device(device)?
     };
 

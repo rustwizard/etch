@@ -21,6 +21,10 @@ use tracing::info;
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    anyhow::ensure!(
+        !(args.seed.is_some() && args.seed_range.is_some()),
+        "--seed and --seed-range are mutually exclusive"
+    );
 
     let builder = tracing_subscriber::fmt().with_env_filter(
         tracing_subscriber::EnvFilter::try_from_default_env()
@@ -76,11 +80,14 @@ fn main() -> Result<()> {
         let out_path = iter_args.output.as_deref().expect("output set above");
         if let Err(e) = result {
             tracing::error!("Seed {seed} failed: {e}");
-            let _ = logger::write_log_failure(out_path, &iter_args, seed, &e);
+            if let Err(log_err) = logger::write_log_failure(out_path, &iter_args, seed, &e) {
+                tracing::warn!("Failed to write failure log: {log_err}");
+            }
             continue;
         }
-        info!("Total time: {:.1}s", t0.elapsed().as_secs_f32());
-        logger::write_log_entry(out_path, &iter_args, seed)?;
+        let elapsed = t0.elapsed().as_secs_f32();
+        info!("Total time: {:.1}s", elapsed);
+        logger::write_log_entry(out_path, &iter_args, seed, elapsed)?;
     }
 
     Ok(())

@@ -1,8 +1,8 @@
 use crate::cli::{Args, Model};
 use anyhow::Result;
 
-pub fn write_log_entry(out_path: &str, args: &Args, seed: u64) -> Result<()> {
-    write_entry(out_path, args, seed, None)
+pub fn write_log_entry(out_path: &str, args: &Args, seed: u64, elapsed_secs: f32) -> Result<()> {
+    write_entry(out_path, args, seed, elapsed_secs, None)
 }
 
 pub fn write_log_failure(
@@ -11,10 +11,16 @@ pub fn write_log_failure(
     seed: u64,
     err: &anyhow::Error,
 ) -> Result<()> {
-    write_entry(out_path, args, seed, Some(err))
+    write_entry(out_path, args, seed, 0.0, Some(err))
 }
 
-fn write_entry(out_path: &str, args: &Args, seed: u64, err: Option<&anyhow::Error>) -> Result<()> {
+fn write_entry(
+    out_path: &str,
+    args: &Args,
+    seed: u64,
+    elapsed_secs: f32,
+    err: Option<&anyhow::Error>,
+) -> Result<()> {
     let log_path = std::path::Path::new(out_path)
         .parent()
         .unwrap_or(std::path::Path::new("."))
@@ -27,6 +33,9 @@ fn write_entry(out_path: &str, args: &Args, seed: u64, err: Option<&anyhow::Erro
         "steps": args.n_steps,
         "status": if err.is_some() { "failed" } else { "ok" },
     });
+    if err.is_none() {
+        entry["elapsed_secs"] = serde_json::json!(elapsed_secs);
+    }
     if let Some(e) = err {
         entry["error"] = serde_json::json!(format!("{e:#}"));
     }
