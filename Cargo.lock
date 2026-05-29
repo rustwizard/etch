@@ -767,6 +767,7 @@ dependencies = [
  "clap",
  "hf-hub",
  "image",
+ "indicatif",
  "rand 0.8.6",
  "serde_json",
  "tokenizers 0.21.4",

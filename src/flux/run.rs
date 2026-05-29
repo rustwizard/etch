@@ -176,8 +176,8 @@ pub fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
                 _ => Some(Tensor::full(args.flux_guidance as f32, b_sz, &flux_device)?),
             };
             let mut img = state.img.clone();
-            let loop_start = std::time::Instant::now();
-            for (i, window) in timesteps.windows(2).enumerate() {
+            let pb = crate::progress::denoising_bar(n_steps);
+            for window in timesteps.windows(2) {
                 let (t_curr, t_prev) = (window[0], window[1]);
                 let t_vec = Tensor::full(t_curr as f32, b_sz, &flux_device)?;
                 let step_start = std::time::Instant::now();
@@ -192,20 +192,10 @@ pub fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
                     guidance.as_ref(),
                 )?;
                 img = (img + (pred * (t_prev - t_curr))?)?;
-                let step_secs = step_start.elapsed().as_secs_f32();
-                let total_secs = loop_start.elapsed().as_secs_f32();
-                let done = i + 1;
-                let eta = step_secs * (n_steps - done) as f32;
-                let bar_len = 20usize;
-                let filled = bar_len * done / n_steps;
-                let bar: String = "█".repeat(filled) + &"░".repeat(bar_len - filled);
-                print!(
-                    "\rstep {done}/{n_steps} [{bar}] {step_secs:.1}s/step  {total_secs:.0}s elapsed  ETA {eta:.0}s"
-                );
-                use std::io::Write as _;
-                let _ = std::io::stdout().flush();
+                pb.set_message(format!("{:.1}s/step", step_start.elapsed().as_secs_f32()));
+                pb.inc(1);
             }
-            println!();
+            pb.finish_with_message("done");
             img
         };
         let unpacked = flux::sampling::unpack(&denoised, height, width)?;

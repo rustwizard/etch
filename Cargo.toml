@@ -23,6 +23,7 @@ rand = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokenizers = "0.21"
+indicatif = "0.17"
 
 [profile.release]
 opt-level = 3
