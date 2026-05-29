@@ -68,6 +68,13 @@ pub(crate) fn build_karras_schedule(
     (sigmas, timesteps)
 }
 
+fn timestep_index(timesteps: &[usize], timestep: usize) -> candle_core::Result<usize> {
+    timesteps
+        .iter()
+        .position(|&t| t == timestep)
+        .ok_or_else(|| candle_core::Error::Msg(format!("timestep {timestep} not in schedule")))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Karras sigma schedule wrapped around EulerA steps
 // ─────────────────────────────────────────────────────────────────────────────
@@ -101,13 +108,7 @@ impl Scheduler for KarrasEulerAScheduler {
     }
 
     fn scale_model_input(&self, sample: Tensor, timestep: usize) -> candle_core::Result<Tensor> {
-        let i = self
-            .timesteps
-            .iter()
-            .position(|&t| t == timestep)
-            .ok_or_else(|| {
-                candle_core::Error::Msg(format!("timestep {timestep} not in schedule"))
-            })?;
+        let i = timestep_index(&self.timesteps, timestep)?;
         sample / (self.sigmas[i] * self.sigmas[i] + 1.0).sqrt()
     }
 
@@ -117,13 +118,7 @@ impl Scheduler for KarrasEulerAScheduler {
         timestep: usize,
         sample: &Tensor,
     ) -> candle_core::Result<Tensor> {
-        let i = self
-            .timesteps
-            .iter()
-            .position(|&t| t == timestep)
-            .ok_or_else(|| {
-                candle_core::Error::Msg(format!("timestep {timestep} not in schedule"))
-            })?;
+        let i = timestep_index(&self.timesteps, timestep)?;
         let sigma_from = self.sigmas[i];
         let sigma_to = self.sigmas[i + 1];
 
@@ -148,13 +143,7 @@ impl Scheduler for KarrasEulerAScheduler {
         noise: Tensor,
         timestep: usize,
     ) -> candle_core::Result<Tensor> {
-        let i = self
-            .timesteps
-            .iter()
-            .position(|&t| t == timestep)
-            .ok_or_else(|| {
-                candle_core::Error::Msg(format!("timestep {timestep} not in schedule"))
-            })?;
+        let i = timestep_index(&self.timesteps, timestep)?;
         original + (noise * self.sigmas[i])?
     }
 }
@@ -189,13 +178,7 @@ impl Scheduler for Dpm2mKarrasScheduler {
     }
 
     fn scale_model_input(&self, sample: Tensor, timestep: usize) -> candle_core::Result<Tensor> {
-        let i = self
-            .timesteps
-            .iter()
-            .position(|&t| t == timestep)
-            .ok_or_else(|| {
-                candle_core::Error::Msg(format!("timestep {timestep} not in schedule"))
-            })?;
+        let i = timestep_index(&self.timesteps, timestep)?;
         let sigma = self.sigmas[i];
         sample / (sigma * sigma + 1.0).sqrt()
     }
@@ -211,13 +194,7 @@ impl Scheduler for Dpm2mKarrasScheduler {
         timestep: usize,
         sample: &Tensor,
     ) -> candle_core::Result<Tensor> {
-        let i = self
-            .timesteps
-            .iter()
-            .position(|&t| t == timestep)
-            .ok_or_else(|| {
-                candle_core::Error::Msg(format!("timestep {timestep} not in schedule"))
-            })?;
+        let i = timestep_index(&self.timesteps, timestep)?;
         let sigma_from = self.sigmas[i];
         let sigma_to = self.sigmas[i + 1];
 
@@ -259,13 +236,7 @@ impl Scheduler for Dpm2mKarrasScheduler {
         noise: Tensor,
         timestep: usize,
     ) -> candle_core::Result<Tensor> {
-        let i = self
-            .timesteps
-            .iter()
-            .position(|&t| t == timestep)
-            .ok_or_else(|| {
-                candle_core::Error::Msg(format!("timestep {timestep} not in schedule"))
-            })?;
+        let i = timestep_index(&self.timesteps, timestep)?;
         original + (noise * self.sigmas[i])?
     }
 }
