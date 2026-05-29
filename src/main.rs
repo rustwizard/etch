@@ -7,11 +7,12 @@ mod hub;
 mod image;
 mod logger;
 mod lora;
+mod pipeline;
 mod progress;
 mod schedulers;
 mod sdxl;
 
-use cli::{Args, Model};
+use cli::Args;
 
 use anyhow::Result;
 use candle_core::{DType, Device};
@@ -71,12 +72,7 @@ fn main() -> Result<()> {
         };
 
         let t0 = std::time::Instant::now();
-        let result = match iter_args.model {
-            Model::Schnell | Model::Dev | Model::SchnellGguf | Model::DevGguf => {
-                flux::run_flux(&iter_args, &device, dtype)
-            }
-            Model::Araminta => sdxl::run_sdxl(&iter_args, &device, dtype),
-        };
+        let result = pipeline::for_model(iter_args.model).run(&iter_args, &device, dtype);
         let out_path = iter_args.output.as_deref().expect("output set above");
         if let Err(e) = result {
             tracing::error!("Seed {seed} failed: {e}");
