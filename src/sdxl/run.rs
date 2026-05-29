@@ -30,6 +30,20 @@ pub fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     );
     let n_steps = args.n_steps.unwrap_or(20);
     let guidance_scale = args.guidance_scale;
+    anyhow::ensure!(
+        guidance_scale > 0.0,
+        "--guidance-scale must be positive, got {guidance_scale}"
+    );
+    anyhow::ensure!(
+        (0.0..=1.0).contains(&args.lora_scale),
+        "--lora-scale must be in 0.0–1.0, got {}",
+        args.lora_scale
+    );
+    anyhow::ensure!(
+        args.clip_skip >= 1 && args.clip_skip <= 12,
+        "--clip-skip must be in 1–12, got {}",
+        args.clip_skip
+    );
     let use_guide_scale = guidance_scale > 1.0;
 
     let api = hf_hub::api::sync::Api::new()?;
