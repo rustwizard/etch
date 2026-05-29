@@ -3,6 +3,7 @@
 mod cli;
 mod device;
 mod flux;
+mod hub;
 mod image;
 mod logger;
 mod lora;

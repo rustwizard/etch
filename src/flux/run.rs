@@ -49,17 +49,17 @@ pub fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             // SAFETY: file is owned by the HF cache and not modified during inference.
             let vb = unsafe {
                 VarBuilder::from_mmaped_safetensors(
-                    &[repo.get("model.safetensors")?],
+                    &[crate::hub::fetch(&repo, "model.safetensors")?],
                     dtype,
                     device,
                 )?
             };
-            let config: t5::Config =
-                serde_json::from_str(&std::fs::read_to_string(repo.get("config.json")?)?)?;
+            let config: t5::Config = serde_json::from_str(&std::fs::read_to_string(
+                crate::hub::fetch(&repo, "config.json")?,
+            )?)?;
             let mut model = t5::T5EncoderModel::load(vb, &config)?;
-            let tokenizer_file = api
-                .model("lmz/mt5-tokenizers".to_string())
-                .get("t5-v1_1-xxl.tokenizer.json")?;
+            let mt5_repo = api.model("lmz/mt5-tokenizers".to_string());
+            let tokenizer_file = crate::hub::fetch(&mt5_repo, "t5-v1_1-xxl.tokenizer.json")?;
             let tokenizer = Tokenizer::from_file(tokenizer_file).map_err(E::msg)?;
             let mut tokens = tokenizer
                 .encode(args.prompt.as_str(), true)
@@ -79,7 +79,7 @@ pub fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             // SAFETY: file is owned by the HF cache and not modified during inference.
             let vb = unsafe {
                 VarBuilder::from_mmaped_safetensors(
-                    &[repo.get("model.safetensors")?],
+                    &[crate::hub::fetch(&repo, "model.safetensors")?],
                     dtype,
                     device,
                 )?
@@ -96,7 +96,8 @@ pub fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
                 num_attention_heads: 12,
             };
             let model = clip::text_model::ClipTextTransformer::new(vb.pp("text_model"), &config)?;
-            let tokenizer = Tokenizer::from_file(repo.get("tokenizer.json")?).map_err(E::msg)?;
+            let tokenizer = Tokenizer::from_file(crate::hub::fetch(&repo, "tokenizer.json")?)
+                .map_err(E::msg)?;
             let tokens = tokenizer
                 .encode(args.prompt.as_str(), true)
                 .map_err(E::msg)?
@@ -151,15 +152,14 @@ pub fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
                 ),
             };
             let gguf_file = gguf_file.as_str();
-            let path = api
-                .repo(hf_hub::Repo::model(gguf_repo.to_string()))
-                .get(gguf_file)?;
+            let gguf_hf_repo = api.repo(hf_hub::Repo::model(gguf_repo.to_string()));
+            let path = crate::hub::fetch(&gguf_hf_repo, gguf_file)?;
             let vb = load_gguf(&path, gguf_file)?;
             FluxModel::Quantized(Box::new(flux::quantized_model::Flux::new(&cfg, vb)?))
         } else {
             let model_file = match args.model {
-                Model::Dev => bf_repo.get("flux1-dev.safetensors")?,
-                _ => bf_repo.get("flux1-schnell.safetensors")?,
+                Model::Dev => crate::hub::fetch(&bf_repo, "flux1-dev.safetensors")?,
+                _ => crate::hub::fetch(&bf_repo, "flux1-schnell.safetensors")?,
             };
             // SAFETY: file is owned by the HF cache and not modified during inference.
             let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[model_file], dtype, device)? };
@@ -214,7 +214,7 @@ pub fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
         // SAFETY: file is owned by the HF cache and not modified during inference.
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(
-                &[bf_repo.get("ae.safetensors")?],
+                &[crate::hub::fetch(&bf_repo, "ae.safetensors")?],
                 DType::F32,
                 &vae_device,
             )?

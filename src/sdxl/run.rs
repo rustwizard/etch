@@ -57,7 +57,7 @@ pub fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
         move |rel: &str| -> Result<std::path::PathBuf> {
             match &local {
                 Some(dir) => Ok(std::path::PathBuf::from(dir).join(rel)),
-                None => Ok(repo.get(rel)?),
+                None => crate::hub::fetch(&repo, rel),
             }
         }
     };
@@ -88,9 +88,10 @@ pub fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     let tok1 = {
         let path = match &args.local_model {
             Some(dir) => std::path::PathBuf::from(dir).join("tokenizer/tokenizer.json"),
-            None => api
-                .model("openai/clip-vit-large-patch14".to_string())
-                .get("tokenizer.json")?,
+            None => {
+                let repo = api.model("openai/clip-vit-large-patch14".to_string());
+                crate::hub::fetch(&repo, "tokenizer.json")?
+            }
         };
         Tokenizer::from_file(path).map_err(E::msg)?
     };
@@ -99,9 +100,10 @@ pub fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     let tok2 = {
         let path = match &args.local_model {
             Some(dir) => std::path::PathBuf::from(dir).join("tokenizer_2/tokenizer.json"),
-            None => api
-                .model("laion/CLIP-ViT-bigG-14-laion2B-39B-b160k".to_string())
-                .get("tokenizer.json")?,
+            None => {
+                let repo = api.model("laion/CLIP-ViT-bigG-14-laion2B-39B-b160k".to_string());
+                crate::hub::fetch(&repo, "tokenizer.json")?
+            }
         };
         Tokenizer::from_file(path).map_err(E::msg)?
     };
@@ -109,7 +111,12 @@ pub fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     // Load LoRA weights once; shared across UNet and both text encoders.
     let lora_map: Option<std::collections::HashMap<String, Tensor>> = if let Some(p) = &args.lora {
         info!("Loading LoRA: {p} (scale {})", args.lora_scale);
-        Some(candle_core::safetensors::load(p, &Device::Cpu)?)
+        let map = candle_core::safetensors::load(p, &Device::Cpu)?;
+        anyhow::ensure!(
+            map.keys().any(|k| k.ends_with(".lora_down.weight")),
+            "{p}: no LoRA keys found (expected keys ending in .lora_down.weight) — is this a valid LoRA file?"
+        );
+        Some(map)
     } else {
         None
     };
