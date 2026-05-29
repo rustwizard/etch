@@ -10,7 +10,15 @@ use tracing::info;
 use super::gguf::load_gguf;
 use super::model::FluxModel;
 
-pub fn run_flux(args: &Args, device: &Device, dtype: DType) -> Result<()> {
+pub struct FluxPipeline;
+
+impl crate::pipeline::Pipeline for FluxPipeline {
+    fn run(&self, args: &Args, device: &Device, dtype: DType) -> Result<()> {
+        run_flux_inner(args, device, dtype)
+    }
+}
+
+fn run_flux_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     let height = args.height.unwrap_or(768);
     let width = args.width.unwrap_or(1360);
     anyhow::ensure!(

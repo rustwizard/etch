@@ -17,7 +17,15 @@ use tracing::info;
 
 use super::clip::{ClipEmbedCtx, sdxl_clip_emb};
 
-pub fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
+pub struct SdxlPipeline;
+
+impl crate::pipeline::Pipeline for SdxlPipeline {
+    fn run(&self, args: &Args, device: &Device, dtype: DType) -> Result<()> {
+        run_sdxl_inner(args, device, dtype)
+    }
+}
+
+fn run_sdxl_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     let height = args.height.unwrap_or(768);
     let width = args.width.unwrap_or(1024);
     anyhow::ensure!(
