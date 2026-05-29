@@ -6,6 +6,7 @@ mod flux;
 mod image;
 mod logger;
 mod lora;
+mod progress;
 mod schedulers;
 mod sdxl;
 

@@ -190,9 +190,9 @@ pub fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
         .to_dtype(dtype)?;
 
     let timesteps = scheduler.timesteps().to_vec();
-    let loop_start = std::time::Instant::now();
-    for (i, &timestep) in timesteps.iter().enumerate() {
-        let t_step = std::time::Instant::now();
+    let pb = crate::progress::denoising_bar(n_steps);
+    for &timestep in &timesteps {
+        let step_start = std::time::Instant::now();
         let latent_input = if use_guide_scale {
             Tensor::cat(&[&latents, &latents], 0)?
         } else {
@@ -208,20 +208,10 @@ pub fn run_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             noise_pred
         };
         latents = scheduler.step(&noise_pred, timestep, &latents)?;
-        let step_secs = t_step.elapsed().as_secs_f32();
-        let total_secs = loop_start.elapsed().as_secs_f32();
-        let done = i + 1;
-        let eta = step_secs * (n_steps - done) as f32;
-        let bar_len = 20usize;
-        let filled = bar_len * done / n_steps;
-        let bar: String = "█".repeat(filled) + &"░".repeat(bar_len - filled);
-        print!(
-            "\rstep {done}/{n_steps} [{bar}] {step_secs:.1}s/step  {total_secs:.0}s elapsed  ETA {eta:.0}s"
-        );
-        use std::io::Write as _;
-        let _ = std::io::stdout().flush();
+        pb.set_message(format!("{:.1}s/step", step_start.elapsed().as_secs_f32()));
+        pb.inc(1);
     }
-    println!();
+    pb.finish_with_message("done");
 
     drop(unet);
     drop(text_embeddings);
