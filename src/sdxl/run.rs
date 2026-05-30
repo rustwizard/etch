@@ -139,10 +139,12 @@ fn run_sdxl_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             dtype,
             use_guide_scale,
         };
+        let te1_path = model_file("text_encoder/model.safetensors")?;
+        crate::hub::log_model_size(&te1_path, "CLIP-1 (ViT-L/14)");
         let emb1 = sdxl_clip_emb(
             &ctx,
             &tok1,
-            model_file("text_encoder/model.safetensors")?,
+            te1_path,
             &sd_config.clip,
             lora_map.as_ref().map(|m| (m, "lora_te1_", args.lora_scale)),
         )?;
@@ -150,10 +152,12 @@ fn run_sdxl_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             .clip2
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("SDXL config missing clip2"))?;
+        let te2_path = model_file("text_encoder_2/model.safetensors")?;
+        crate::hub::log_model_size(&te2_path, "CLIP-2 (ViT-bigG)");
         let emb2 = sdxl_clip_emb(
             &ctx,
             &tok2,
-            model_file("text_encoder_2/model.safetensors")?,
+            te2_path,
             clip2_config,
             lora_map.as_ref().map(|m| (m, "lora_te2_", args.lora_scale)),
         )?;
@@ -164,6 +168,7 @@ fn run_sdxl_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
 
     let unet = {
         let unet_weights = model_file("unet/diffusion_pytorch_model.safetensors")?;
+        crate::hub::log_model_size(&unet_weights, "UNet");
         if let Some(lora) = &lora_map {
             info!("Applying UNet LoRA (scale {})", args.lora_scale);
             let mut tensors = candle_core::safetensors::load(&unet_weights, &Device::Cpu)?;
@@ -238,11 +243,9 @@ fn run_sdxl_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     } else {
         device.clone()
     };
-    let vae = sd_config.build_vae(
-        model_file("vae/diffusion_pytorch_model.safetensors")?,
-        &vae_device,
-        DType::F32,
-    )?;
+    let vae_path = model_file("vae/diffusion_pytorch_model.safetensors")?;
+    crate::hub::log_model_size(&vae_path, "VAE");
+    let vae = sd_config.build_vae(vae_path, &vae_device, DType::F32)?;
     let latents = latents.to_device(&vae_device)?;
     let img = vae.decode(&(latents.to_dtype(DType::F32)? / vae_scale)?)?;
     drop(vae);

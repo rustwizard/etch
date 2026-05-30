@@ -54,14 +54,10 @@ fn run_flux_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
         let t5_handle = s.spawn(|| -> Result<Tensor> {
             let api = hf_hub::api::sync::Api::new()?;
             let repo = api.model("mcmonkey/google_t5-v1_1-xxl_encoderonly".to_string());
+            let t5_path = crate::hub::fetch(&repo, "model.safetensors")?;
+            crate::hub::log_model_size(&t5_path, "T5-v1.1-XXL");
             // SAFETY: file is owned by the HF cache and not modified during inference.
-            let vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(
-                    &[crate::hub::fetch(&repo, "model.safetensors")?],
-                    dtype,
-                    device,
-                )?
-            };
+            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[t5_path], dtype, device)? };
             let config: t5::Config = serde_json::from_str(&std::fs::read_to_string(
                 crate::hub::fetch(&repo, "config.json")?,
             )?)?;
@@ -84,14 +80,10 @@ fn run_flux_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             let repo = api.repo(hf_hub::Repo::model(
                 "openai/clip-vit-large-patch14".to_string(),
             ));
+            let clip_path = crate::hub::fetch(&repo, "model.safetensors")?;
+            crate::hub::log_model_size(&clip_path, "CLIP ViT-L/14");
             // SAFETY: file is owned by the HF cache and not modified during inference.
-            let vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(
-                    &[crate::hub::fetch(&repo, "model.safetensors")?],
-                    dtype,
-                    device,
-                )?
-            };
+            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[clip_path], dtype, device)? };
             let config = clip::text_model::ClipTextConfig {
                 vocab_size: 49408,
                 projection_dim: 768,
@@ -145,6 +137,7 @@ fn run_flux_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             _ => flux::sampling::get_schedule(n_steps, None),
         };
         let model = if let Some(gguf_path) = &args.gguf {
+            crate::hub::log_model_size(std::path::Path::new(gguf_path), "FLUX DiT (GGUF)");
             let vb = load_gguf(gguf_path, gguf_path)?;
             FluxModel::Quantized(Box::new(flux::quantized_model::Flux::new(&cfg, vb)?))
         } else if matches!(args.model, Model::SchnellGguf | Model::DevGguf) {
@@ -162,6 +155,7 @@ fn run_flux_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             let gguf_file = gguf_file.as_str();
             let gguf_hf_repo = api.repo(hf_hub::Repo::model(gguf_repo.to_string()));
             let path = crate::hub::fetch(&gguf_hf_repo, gguf_file)?;
+            crate::hub::log_model_size(&path, "FLUX DiT (GGUF)");
             let vb = load_gguf(&path, gguf_file)?;
             FluxModel::Quantized(Box::new(flux::quantized_model::Flux::new(&cfg, vb)?))
         } else {
@@ -169,6 +163,7 @@ fn run_flux_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
                 Model::Dev => crate::hub::fetch(&bf_repo, "flux1-dev.safetensors")?,
                 _ => crate::hub::fetch(&bf_repo, "flux1-schnell.safetensors")?,
             };
+            crate::hub::log_model_size(&model_file, "FLUX DiT");
             // SAFETY: file is owned by the HF cache and not modified during inference.
             let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[model_file], dtype, device)? };
             FluxModel::Full(Box::new(flux::model::Flux::new(&cfg, vb)?))
@@ -221,14 +216,11 @@ fn run_flux_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     };
     let img = img.to_device(&vae_device)?;
     let img = {
+        let ae_path = crate::hub::fetch(&bf_repo, "ae.safetensors")?;
+        crate::hub::log_model_size(&ae_path, "VAE");
         // SAFETY: file is owned by the HF cache and not modified during inference.
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(
-                &[crate::hub::fetch(&bf_repo, "ae.safetensors")?],
-                DType::F32,
-                &vae_device,
-            )?
-        };
+        let vb =
+            unsafe { VarBuilder::from_mmaped_safetensors(&[ae_path], DType::F32, &vae_device)? };
         let cfg = match args.model {
             Model::Dev | Model::DevGguf => flux::autoencoder::Config::dev(),
             _ => flux::autoencoder::Config::schnell(),
