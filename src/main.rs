@@ -8,10 +8,12 @@ mod hub;
 mod image;
 mod logger;
 mod lora;
+mod offload;
 mod pipeline;
 mod progress;
 mod schedulers;
 mod sdxl;
+mod ssd;
 mod vae_tiling;
 
 use cli::Args;

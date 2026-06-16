@@ -1,3 +1,4 @@
+use crate::offload::OffloadTarget;
 use anyhow::Result;
 use candle_core::DType;
 use clap::Parser;
@@ -111,6 +112,19 @@ pub struct Args {
     /// Used only when --vae-tile-size is set.
     #[arg(long, default_value_t = 8)]
     pub vae_tile_overlap: usize,
+
+    /// Offload model weights to CPU or SSD, loading only the active layer onto
+    /// the compute device. Reduces peak VRAM at the cost of speed.
+    #[arg(long, value_enum)]
+    pub offload_target: Option<OffloadTarget>,
+
+    /// Buffer size in GB for SSD prefetching (default: 4).
+    #[arg(long, default_value = "4")]
+    pub ssd_buffer_gb: usize,
+
+    /// Disable async layer prefetching during SSD streaming.
+    #[arg(long)]
+    pub ssd_no_prefetch: bool,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
