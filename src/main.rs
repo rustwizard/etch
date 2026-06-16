@@ -1,5 +1,6 @@
 #![deny(clippy::unwrap_used)]
 
+mod cache;
 mod cli;
 mod device;
 mod flux;
@@ -11,6 +12,7 @@ mod pipeline;
 mod progress;
 mod schedulers;
 mod sdxl;
+mod vae_tiling;
 
 use cli::Args;
 

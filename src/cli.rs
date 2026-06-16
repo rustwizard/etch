@@ -94,6 +94,23 @@ pub struct Args {
     /// Enable verbose logging: show timestamps and module targets.
     #[arg(long)]
     pub verbose: bool,
+
+    /// Load text encoders sequentially instead of in parallel.
+    /// Reduces peak VRAM during text encoding (~9 GB savings on FLUX)
+    /// at the cost of slightly slower startup.
+    #[arg(long)]
+    pub sequential_te: bool,
+
+    /// Tile size for VAE decode in latent pixels (default: 0 = disabled).
+    /// Tiling reduces VAE VRAM usage for large images.
+    /// Recommended: 64 for SDXL (latent = image/8), 128 for FLUX (latent = image/2).
+    #[arg(long, default_value_t = 0)]
+    pub vae_tile_size: usize,
+
+    /// Overlap between VAE tiles in latent pixels (default: 8).
+    /// Used only when --vae-tile-size is set.
+    #[arg(long, default_value_t = 8)]
+    pub vae_tile_overlap: usize,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]

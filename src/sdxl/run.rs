@@ -1,3 +1,4 @@
+use crate::cache::{CacheKey, EmbeddingCache};
 use crate::cli::{Args, SamplerType};
 use crate::schedulers::{Dpm2mKarrasScheduler, KarrasEulerAScheduler};
 use crate::{image, lora};
@@ -12,6 +13,7 @@ use candle_transformers::models::stable_diffusion::{
     schedulers::{PredictionType, Scheduler},
     unet_2d,
 };
+use std::collections::HashMap;
 use tokenizers::Tokenizer;
 use tracing::info;
 
@@ -131,36 +133,78 @@ fn run_sdxl_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
 
     // Build embeddings from both encoders and cat along hidden dim
     let text_embeddings = {
-        let ctx = ClipEmbedCtx {
-            prompt: &args.prompt,
-            uncond_prompt: &args.uncond_prompt,
-            clip_skip: args.clip_skip,
-            device,
-            dtype,
-            use_guide_scale,
-        };
-        let te1_path = model_file("text_encoder/model.safetensors")?;
-        crate::hub::log_model_size(&te1_path, "CLIP-1 (ViT-L/14)");
-        let emb1 = sdxl_clip_emb(
-            &ctx,
-            &tok1,
-            te1_path,
-            &sd_config.clip,
-            lora_map.as_ref().map(|m| (m, "lora_te1_", args.lora_scale)),
-        )?;
-        let clip2_config = sd_config
-            .clip2
+        let cache = EmbeddingCache::new(EmbeddingCache::default_dir());
+        let lora_key = args
+            .lora
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("SDXL config missing clip2"))?;
-        let te2_path = model_file("text_encoder_2/model.safetensors")?;
-        crate::hub::log_model_size(&te2_path, "CLIP-2 (ViT-bigG)");
-        let emb2 = sdxl_clip_emb(
-            &ctx,
-            &tok2,
-            te2_path,
-            clip2_config,
-            lora_map.as_ref().map(|m| (m, "lora_te2_", args.lora_scale)),
-        )?;
+            .map(|p| format!("{p}-{}", args.lora_scale));
+        let clip_skip_key = if args.clip_skip > 1 {
+            Some(format!("cs{}", args.clip_skip))
+        } else {
+            None
+        };
+        let parts: Vec<&str> = {
+            let mut v: Vec<&str> = vec!["sdxl", &args.prompt, &args.uncond_prompt];
+            if let Some(ref lk) = lora_key {
+                v.push(lk);
+            }
+            if let Some(ref cs) = clip_skip_key {
+                v.push(cs);
+            }
+            v
+        };
+        let cache_key = CacheKey::from_parts(&parts);
+
+        let (emb1, emb2) = if let Some(mut cached) = cache
+            .get(&cache_key, &["emb1", "emb2"], device)
+            .ok()
+            .flatten()
+        {
+            info!("Using cached embeddings for prompt");
+            (
+                cached.remove("emb1").expect("emb1 in cache"),
+                cached.remove("emb2").expect("emb2 in cache"),
+            )
+        } else {
+            let ctx = ClipEmbedCtx {
+                prompt: &args.prompt,
+                uncond_prompt: &args.uncond_prompt,
+                clip_skip: args.clip_skip,
+                device,
+                dtype,
+                use_guide_scale,
+            };
+            let te1_path = model_file("text_encoder/model.safetensors")?;
+            crate::hub::log_model_size(&te1_path, "CLIP-1 (ViT-L/14)");
+            let emb1 = sdxl_clip_emb(
+                &ctx,
+                &tok1,
+                te1_path,
+                &sd_config.clip,
+                lora_map.as_ref().map(|m| (m, "lora_te1_", args.lora_scale)),
+            )?;
+            let clip2_config = sd_config
+                .clip2
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("SDXL config missing clip2"))?;
+            let te2_path = model_file("text_encoder_2/model.safetensors")?;
+            crate::hub::log_model_size(&te2_path, "CLIP-2 (ViT-bigG)");
+            let emb2 = sdxl_clip_emb(
+                &ctx,
+                &tok2,
+                te2_path,
+                clip2_config,
+                lora_map.as_ref().map(|m| (m, "lora_te2_", args.lora_scale)),
+            )?;
+
+            let mut save_map = HashMap::new();
+            save_map.insert("emb1".to_string(), emb1.to_device(&Device::Cpu)?);
+            save_map.insert("emb2".to_string(), emb2.to_device(&Device::Cpu)?);
+            if let Err(e) = cache.set(&cache_key, &save_map) {
+                tracing::warn!("Failed to save embedding cache: {e}");
+            }
+            (emb1, emb2)
+        };
         // [batch, 77, 768] ++ [batch, 77, 1280] → [batch, 77, 2048]
         Tensor::cat(&[emb1, emb2], D::Minus1)?
     };
@@ -211,7 +255,7 @@ fn run_sdxl_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
 
     let timesteps = scheduler.timesteps().to_vec();
     let pb = crate::progress::denoising_bar(n_steps);
-    for &timestep in &timesteps {
+    for (step, &timestep) in timesteps.iter().enumerate() {
         let step_start = std::time::Instant::now();
         let latent_input = if use_guide_scale {
             Tensor::cat(&[&latents, &latents], 0)?
@@ -228,7 +272,9 @@ fn run_sdxl_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             noise_pred
         };
         latents = scheduler.step(&noise_pred, timestep, &latents)?;
-        pb.set_message(format!("{:.1}s/step", step_start.elapsed().as_secs_f32()));
+        let dur = step_start.elapsed();
+        let eta = dur.as_secs_f32() * (n_steps.saturating_sub(step + 1)) as f32;
+        pb.set_message(format!("{:.1}s/step  ETA {:.0}s", dur.as_secs_f32(), eta));
         pb.inc(1);
     }
     pb.finish_with_message("done");
@@ -247,7 +293,17 @@ fn run_sdxl_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     crate::hub::log_model_size(&vae_path, "VAE");
     let vae = sd_config.build_vae(vae_path, &vae_device, DType::F32)?;
     let latents = latents.to_device(&vae_device)?;
-    let img = vae.decode(&(latents.to_dtype(DType::F32)? / vae_scale)?)?;
+    let latents_f32 = (latents.to_dtype(DType::F32)? / vae_scale)?;
+    let img = if args.vae_tile_size > 0 {
+        let tile_size = args.vae_tile_size;
+        let overlap = args.vae_tile_overlap;
+        tracing::info!("Tiled VAE decode: tile={tile_size} overlap={overlap} (latent px)");
+        crate::vae_tiling::tiled_decode(&latents_f32, tile_size, overlap, height, width, |tile| {
+            Ok(vae.decode(tile)?)
+        })?
+    } else {
+        vae.decode(&latents_f32)?
+    };
     drop(vae);
     let img = img.to_device(&Device::Cpu)?;
     let img = ((img / 2.)? + 0.5)?.clamp(0f32, 1f32)?;
