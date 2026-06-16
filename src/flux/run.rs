@@ -1,9 +1,11 @@
+use crate::cache::{CacheKey, EmbeddingCache};
 use crate::cli::{Args, Model, Quantization};
 use crate::image;
 use anyhow::{Error as E, Result};
 use candle_core::{DType, Device, IndexOp, Module, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::{clip, flux, t5};
+use std::collections::HashMap;
 use tokenizers::Tokenizer;
 use tracing::info;
 
@@ -49,72 +51,29 @@ fn run_flux_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
         api.repo(hf_hub::Repo::model(name.to_string()))
     };
 
-    // T5 and CLIP are independent — load and encode in parallel.
-    let (t5_emb, clip_emb) = std::thread::scope(|s| {
-        let t5_handle = s.spawn(|| -> Result<Tensor> {
-            let api = hf_hub::api::sync::Api::new()?;
-            let repo = api.model("mcmonkey/google_t5-v1_1-xxl_encoderonly".to_string());
-            let t5_path = crate::hub::fetch(&repo, "model.safetensors")?;
-            crate::hub::log_model_size(&t5_path, "T5-v1.1-XXL");
-            // SAFETY: file is owned by the HF cache and not modified during inference.
-            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[t5_path], dtype, device)? };
-            let config: t5::Config = serde_json::from_str(&std::fs::read_to_string(
-                crate::hub::fetch(&repo, "config.json")?,
-            )?)?;
-            let mut model = t5::T5EncoderModel::load(vb, &config)?;
-            let mt5_repo = api.model("lmz/mt5-tokenizers".to_string());
-            let tokenizer_file = crate::hub::fetch(&mt5_repo, "t5-v1_1-xxl.tokenizer.json")?;
-            let tokenizer = Tokenizer::from_file(tokenizer_file).map_err(E::msg)?;
-            let mut tokens = tokenizer
-                .encode(args.prompt.as_str(), true)
-                .map_err(E::msg)?
-                .get_ids()
-                .to_vec();
-            tokens.resize(256, 0);
-            let emb = model.forward(&Tensor::new(&tokens[..], device)?.unsqueeze(0)?)?;
-            Ok(emb.to_device(&flux_device)?)
-        });
+    let cache = EmbeddingCache::new(EmbeddingCache::default_dir());
+    let cache_key = CacheKey::from_parts(&["flux", &format!("{:?}", args.model), &args.prompt]);
 
-        let clip_handle = s.spawn(|| -> Result<Tensor> {
-            let api = hf_hub::api::sync::Api::new()?;
-            let repo = api.repo(hf_hub::Repo::model(
-                "openai/clip-vit-large-patch14".to_string(),
-            ));
-            let clip_path = crate::hub::fetch(&repo, "model.safetensors")?;
-            crate::hub::log_model_size(&clip_path, "CLIP ViT-L/14");
-            // SAFETY: file is owned by the HF cache and not modified during inference.
-            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[clip_path], dtype, device)? };
-            let config = clip::text_model::ClipTextConfig {
-                vocab_size: 49408,
-                projection_dim: 768,
-                activation: clip::text_model::Activation::QuickGelu,
-                intermediate_size: 3072,
-                embed_dim: 768,
-                max_position_embeddings: 77,
-                pad_with: None,
-                num_hidden_layers: 12,
-                num_attention_heads: 12,
-            };
-            let model = clip::text_model::ClipTextTransformer::new(vb.pp("text_model"), &config)?;
-            let tokenizer = Tokenizer::from_file(crate::hub::fetch(&repo, "tokenizer.json")?)
-                .map_err(E::msg)?;
-            let tokens = tokenizer
-                .encode(args.prompt.as_str(), true)
-                .map_err(E::msg)?
-                .get_ids()
-                .to_vec();
-            let emb = model.forward(&Tensor::new(&tokens[..], device)?.unsqueeze(0)?)?;
-            Ok(emb.to_device(&flux_device)?)
-        });
-
-        let t5_emb = t5_handle
-            .join()
-            .map_err(|e| anyhow::anyhow!("T5 thread panicked: {e:?}"))??;
-        let clip_emb = clip_handle
-            .join()
-            .map_err(|e| anyhow::anyhow!("CLIP thread panicked: {e:?}"))??;
-        Ok::<_, anyhow::Error>((t5_emb, clip_emb))
-    })?;
+    let (t5_emb, clip_emb) = if let Some(mut cached) = cache
+        .get(&cache_key, &["t5_emb", "clip_emb"], &flux_device)
+        .ok()
+        .flatten()
+    {
+        info!("Using cached embeddings for prompt");
+        (
+            cached.remove("t5_emb").expect("t5_emb in cache"),
+            cached.remove("clip_emb").expect("clip_emb in cache"),
+        )
+    } else {
+        let (t5_emb, clip_emb) = load_and_encode_text(args, device, dtype, &flux_device)?;
+        let mut save_map = HashMap::new();
+        save_map.insert("t5_emb".to_string(), t5_emb.to_device(&Device::Cpu)?);
+        save_map.insert("clip_emb".to_string(), clip_emb.to_device(&Device::Cpu)?);
+        if let Err(e) = cache.set(&cache_key, &save_map) {
+            tracing::warn!("Failed to save embedding cache: {e}");
+        }
+        (t5_emb, clip_emb)
+    };
     info!("T5: {:?}", t5_emb.shape());
     info!("CLIP: {:?}", clip_emb.shape());
 
@@ -180,7 +139,7 @@ fn run_flux_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             };
             let mut img = state.img.clone();
             let pb = crate::progress::denoising_bar(n_steps);
-            for window in timesteps.windows(2) {
+            for (step, window) in timesteps.windows(2).enumerate() {
                 let (t_curr, t_prev) = (window[0], window[1]);
                 let t_vec = Tensor::full(t_curr as f32, b_sz, &flux_device)?;
                 let step_start = std::time::Instant::now();
@@ -195,7 +154,9 @@ fn run_flux_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
                     guidance.as_ref(),
                 )?;
                 img = (img + (pred * (t_prev - t_curr))?)?;
-                pb.set_message(format!("{:.1}s/step", step_start.elapsed().as_secs_f32()));
+                let dur = step_start.elapsed();
+                let eta = dur.as_secs_f32() * (n_steps.saturating_sub(step + 1)) as f32;
+                pb.set_message(format!("{:.1}s/step  ETA {:.0}s", dur.as_secs_f32(), eta));
                 pb.inc(1);
             }
             pb.finish_with_message("done");
@@ -225,7 +186,17 @@ fn run_flux_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
             Model::Dev | Model::DevGguf => flux::autoencoder::Config::dev(),
             _ => flux::autoencoder::Config::schnell(),
         };
-        flux::autoencoder::AutoEncoder::new(&cfg, vb)?.decode(&img)?
+        let vae = flux::autoencoder::AutoEncoder::new(&cfg, vb)?;
+        if args.vae_tile_size > 0 {
+            let tile_size = args.vae_tile_size;
+            let overlap = args.vae_tile_overlap;
+            tracing::info!("Tiled VAE decode: tile={tile_size} overlap={overlap} (latent px)");
+            crate::vae_tiling::tiled_decode(&img, tile_size, overlap, height, width, |tile| {
+                Ok(vae.decode(tile)?)
+            })?
+        } else {
+            vae.decode(&img)?
+        }
     };
 
     let img = img.to_device(&Device::Cpu)?;
@@ -234,4 +205,96 @@ fn run_flux_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     image::save_image(&img.i(0)?, out)?;
     info!("Saved to {out}");
     Ok(())
+}
+
+fn load_and_encode_text(
+    args: &Args,
+    device: &Device,
+    dtype: DType,
+    flux_device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    if args.sequential_te {
+        let t5_emb = load_and_encode_t5(args, device, dtype, flux_device)?;
+        let clip_emb = load_and_encode_clip(args, device, dtype, flux_device)?;
+        Ok((t5_emb, clip_emb))
+    } else {
+        // T5 and CLIP are independent — load and encode in parallel.
+        std::thread::scope(|s| {
+            let t5_handle = s.spawn(|| load_and_encode_t5(args, device, dtype, flux_device));
+            let clip_handle = s.spawn(|| load_and_encode_clip(args, device, dtype, flux_device));
+
+            let t5_emb = t5_handle
+                .join()
+                .map_err(|e| anyhow::anyhow!("T5 thread panicked: {e:?}"))??;
+            let clip_emb = clip_handle
+                .join()
+                .map_err(|e| anyhow::anyhow!("CLIP thread panicked: {e:?}"))??;
+            Ok((t5_emb, clip_emb))
+        })
+    }
+}
+
+fn load_and_encode_t5(
+    args: &Args,
+    device: &Device,
+    dtype: DType,
+    flux_device: &Device,
+) -> Result<Tensor> {
+    let api = hf_hub::api::sync::Api::new()?;
+    let repo = api.model("mcmonkey/google_t5-v1_1-xxl_encoderonly".to_string());
+    let t5_path = crate::hub::fetch(&repo, "model.safetensors")?;
+    crate::hub::log_model_size(&t5_path, "T5-v1.1-XXL");
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[t5_path], dtype, device)? };
+    let config: t5::Config = serde_json::from_str(&std::fs::read_to_string(crate::hub::fetch(
+        &repo,
+        "config.json",
+    )?)?)?;
+    let mut model = t5::T5EncoderModel::load(vb, &config)?;
+    let mt5_repo = api.model("lmz/mt5-tokenizers".to_string());
+    let tokenizer_file = crate::hub::fetch(&mt5_repo, "t5-v1_1-xxl.tokenizer.json")?;
+    let tokenizer = Tokenizer::from_file(tokenizer_file).map_err(E::msg)?;
+    let mut tokens = tokenizer
+        .encode(args.prompt.as_str(), true)
+        .map_err(E::msg)?
+        .get_ids()
+        .to_vec();
+    tokens.resize(256, 0);
+    let emb = model.forward(&Tensor::new(&tokens[..], device)?.unsqueeze(0)?)?;
+    Ok(emb.to_device(flux_device)?)
+}
+
+fn load_and_encode_clip(
+    args: &Args,
+    device: &Device,
+    dtype: DType,
+    flux_device: &Device,
+) -> Result<Tensor> {
+    let api = hf_hub::api::sync::Api::new()?;
+    let repo = api.repo(hf_hub::Repo::model(
+        "openai/clip-vit-large-patch14".to_string(),
+    ));
+    let clip_path = crate::hub::fetch(&repo, "model.safetensors")?;
+    crate::hub::log_model_size(&clip_path, "CLIP ViT-L/14");
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[clip_path], dtype, device)? };
+    let config = clip::text_model::ClipTextConfig {
+        vocab_size: 49408,
+        projection_dim: 768,
+        activation: clip::text_model::Activation::QuickGelu,
+        intermediate_size: 3072,
+        embed_dim: 768,
+        max_position_embeddings: 77,
+        pad_with: None,
+        num_hidden_layers: 12,
+        num_attention_heads: 12,
+    };
+    let model = clip::text_model::ClipTextTransformer::new(vb.pp("text_model"), &config)?;
+    let tokenizer =
+        Tokenizer::from_file(crate::hub::fetch(&repo, "tokenizer.json")?).map_err(E::msg)?;
+    let tokens = tokenizer
+        .encode(args.prompt.as_str(), true)
+        .map_err(E::msg)?
+        .get_ids()
+        .to_vec();
+    let emb = model.forward(&Tensor::new(&tokens[..], device)?.unsqueeze(0)?)?;
+    Ok(emb.to_device(flux_device)?)
 }

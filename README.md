@@ -35,7 +35,7 @@ FLUX loads ~36 GB of weights in total (DiT + T5-XXL + CLIP) in F32. On 32 GB mac
 | FLUX.1-schnell / dev | 24 GB | 32 GB |
 | Araminta (SDXL) | 8 GB | 12 GB |
 
-On 8–12 GB cards use `--vae-cpu` to avoid OOM during VAE decode at 1024×1024.
+On 8–12 GB cards use `--vae-tile-size 64` or `--vae-cpu` to avoid OOM during VAE decode at 1024×1024.
 
 ## Build
 
@@ -151,6 +151,7 @@ pipe.save_pretrained("/path/to/sdxl-diffusers")
 | `--width` | 1360 / 1024 | Output width in pixels |
 | `--n-steps` | 4 / 50 / 20 | Denoising steps |
 | `--guidance-scale` | `7.5` | CFG scale (SDXL only) |
+| `--flux-guidance` | `3.5` | Guidance scale for FLUX dev |
 | `--scheduler` | `euler-a` | Sampler type (SDXL only) |
 | `--clip-skip` | `1` | CLIP layers to skip from end (SDXL only) |
 | `--seed` | random | Random seed for reproducibility |
@@ -163,7 +164,11 @@ pipe.save_pretrained("/path/to/sdxl-diffusers")
 | `--quantization` | `q8` | `q8` / `q4` (for schnell-gguf / dev-gguf) |
 | `--dtype` | `bf16` (GPU), `f32` (CPU) | Tensor dtype: `f32`, `bf16`, `f16` |
 | `--vae-cpu` | — | Decode VAE on CPU (slower, less GPU memory) |
+| `--vae-tile-size` | `0` (off) | VAE tile size in latent px: 64 (SDXL) / 128 (FLUX) |
+| `--vae-tile-overlap` | `8` | Overlap between VAE tiles (latent px) |
+| `--sequential-te` | — | Load T5 then CLIP sequentially (~9 GB VRAM savings, FLUX) |
 | `--cpu` | — | Force CPU instead of GPU |
+| `--verbose` | — | Verbose logging |
 
 ## LoRA format
 
@@ -188,14 +193,18 @@ Metal uses an internal memory pool and does not return GPU memory to the OS unti
 | Technique | Effect |
 |-----------|--------|
 | `--dtype bf16` (default on GPU) | ~2× less memory than F32 |
-| `--model schnell-gguf` / `--model dev-gguf` | ~12 GB instead of ~24 GB |
+| `--model schnell-gguf` / `--model dev-gguf` | ~12 GB (q8) / ~7 GB (q4) instead of ~24 GB |
 | `--vae-cpu` | VAE decode on CPU, avoids GPU pool growth from activations |
+| `--vae-tile-size 64` (SDXL) / `--vae-tile-size 128` (FLUX) | Splits VAE decode into tiles, prevents OOM on high-res |
+| `--sequential-te` (FLUX) | Peak VRAM during text encoding drops from ~11 GB to ~1.5 GB |
 | `--cpu` | Skip GPU entirely (much slower, no pool overhead) |
 | `--model araminta` | Smallest model, ~7 GB |
 
+**Embedding cache:** repeated runs with the same prompt skip loading T5/CLIP encoders entirely — saved as safetensors in `~/.cache/etch/embeddings/`. Changes to `--prompt`, `--clip-skip`, `--lora`, or model invalidate the cache automatically.
+
 ### CUDA out of memory on VAE decode
 
-At 1024×1024 the VAE decoder needs ~2 GB of contiguous VRAM in F32. If you get `CUDA_ERROR_OUT_OF_MEMORY`, use `--vae-cpu` to decode on CPU, or reduce resolution to `--height 768 --width 768`.
+At 1024×1024 the VAE decoder needs ~2 GB of contiguous VRAM in F32. If you get `CUDA_ERROR_OUT_OF_MEMORY`, use `--vae-tile-size 64` for tiled decode or `--vae-cpu` to decode on CPU.
 
 ### GGUF models
 
@@ -211,6 +220,8 @@ Quantized FLUX variants from [city96](https://huggingface.co/city96):
 |------|------|-------|---------|
 | `--quantization q8` | ~12 GB | 4 | Best |
 | `--quantization q4` | ~7 GB | 4 | Good |
+
+GGUF runs the DiT on CPU. Add `--vae-tile-size 64` (`128` for ≥768 px) to avoid swapping during VAE decode.
 
 ### Same face on every image
 
