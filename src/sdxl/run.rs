@@ -19,15 +19,44 @@ use tracing::info;
 
 use super::clip::{ClipEmbedCtx, sdxl_clip_emb};
 
-pub struct SdxlPipeline;
+/// Everything loaded once by `prepare` and reused by every `generate` call.
+struct SdxlPrepared {
+    height: usize,
+    width: usize,
+    n_steps: usize,
+    guidance_scale: f64,
+    use_guide_scale: bool,
+    scheduler_type: SamplerType,
+    device: Device,
+    dtype: DType,
+    vae_device: Device,
+    vae_scale: f64,
+    text_embeddings: Tensor,
+    unet: unet_2d::UNet2DConditionModel,
+    vae: stable_diffusion::vae::AutoEncoderKL,
+}
+
+#[derive(Default)]
+pub struct SdxlPipeline {
+    prepared: Option<SdxlPrepared>,
+}
 
 impl crate::pipeline::Pipeline for SdxlPipeline {
-    fn run(&self, args: &Args, device: &Device, dtype: DType) -> Result<()> {
-        run_sdxl_inner(args, device, dtype)
+    fn prepare(&mut self, args: &Args, device: &Device, dtype: DType) -> Result<()> {
+        self.prepared = Some(prepare_sdxl(args, device, dtype)?);
+        Ok(())
+    }
+
+    fn generate(&self, args: &Args) -> Result<()> {
+        let p = self
+            .prepared
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("SDXL pipeline not prepared"))?;
+        generate_sdxl(p, args)
     }
 }
 
-fn run_sdxl_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
+fn prepare_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<SdxlPrepared> {
     let height = args.height.unwrap_or(768);
     let width = args.width.unwrap_or(1024);
     anyhow::ensure!(
@@ -73,26 +102,6 @@ fn run_sdxl_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     };
 
     let sd_config = stable_diffusion::StableDiffusionConfig::sdxl(None, Some(height), Some(width));
-    let mut scheduler: Box<dyn Scheduler> = match args.scheduler {
-        SamplerType::EulerA => {
-            info!("Scheduler: Euler Ancestral");
-            Box::new(EulerAncestralDiscreteScheduler::new(
-                n_steps,
-                EulerAncestralDiscreteSchedulerConfig {
-                    prediction_type: PredictionType::Epsilon,
-                    ..Default::default()
-                },
-            )?)
-        }
-        SamplerType::EulerAKarras => {
-            info!("Scheduler: Euler Ancestral + Karras");
-            Box::new(KarrasEulerAScheduler::new(n_steps)?)
-        }
-        SamplerType::Dpm2mKarras => {
-            info!("Scheduler: DPM++ 2M Karras");
-            Box::new(Dpm2mKarrasScheduler::new(n_steps)?)
-        }
-    };
 
     // Tokenizer 1: from local dir or CLIP HF repo
     let tok1 = {
@@ -119,7 +128,7 @@ fn run_sdxl_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     };
 
     // Load LoRA weights once; shared across UNet and both text encoders.
-    let lora_map: Option<std::collections::HashMap<String, Tensor>> = if let Some(p) = &args.lora {
+    let lora_map: Option<HashMap<String, Tensor>> = if let Some(p) = &args.lora {
         info!("Loading LoRA: {p} (scale {})", args.lora_scale);
         let map = candle_core::safetensors::load(p, &Device::Cpu)?;
         anyhow::ensure!(
@@ -247,43 +256,8 @@ fn run_sdxl_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
         }
     };
 
-    let vae_scale = 0.18215f64;
-    let mut latents =
-        (Tensor::randn(0f32, 1f32, (1usize, 4usize, height / 8, width / 8), device)?
-            * scheduler.init_noise_sigma())?
-        .to_dtype(dtype)?;
-
-    let timesteps = scheduler.timesteps().to_vec();
-    let pb = crate::progress::denoising_bar(n_steps);
-    for (step, &timestep) in timesteps.iter().enumerate() {
-        let step_start = std::time::Instant::now();
-        let latent_input = if use_guide_scale {
-            Tensor::cat(&[&latents, &latents], 0)?
-        } else {
-            latents.clone()
-        };
-        let latent_input = scheduler.scale_model_input(latent_input, timestep)?;
-        let noise_pred = unet.forward(&latent_input, timestep as f64, &text_embeddings)?;
-        let noise_pred = if use_guide_scale {
-            let chunks = noise_pred.chunk(2, 0)?;
-            let (uncond, cond) = (&chunks[0], &chunks[1]);
-            (uncond + ((cond - uncond)? * guidance_scale)?)?
-        } else {
-            noise_pred
-        };
-        latents = scheduler.step(&noise_pred, timestep, &latents)?;
-        let dur = step_start.elapsed();
-        let eta = dur.as_secs_f32() * (n_steps.saturating_sub(step + 1)) as f32;
-        pb.set_message(format!("{:.1}s/step  ETA {:.0}s", dur.as_secs_f32(), eta));
-        pb.inc(1);
-    }
-    pb.finish_with_message("done");
-
-    drop(unet);
-    drop(text_embeddings);
-
-    // Load VAE only after UNet inference — avoids 335 MB Metal residency during the loop.
-    // Optionally on CPU to keep Metal pool from growing with intermediate activations.
+    // Load VAE now (rather than per-image) so batch runs reuse it too. This keeps
+    // the UNet resident during decode — the same tradeoff as the DiT in FLUX.
     let vae_device = if args.vae_cpu {
         Device::Cpu
     } else {
@@ -292,19 +266,96 @@ fn run_sdxl_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     let vae_path = model_file("vae/diffusion_pytorch_model.safetensors")?;
     crate::hub::log_model_size(&vae_path, "VAE");
     let vae = sd_config.build_vae(vae_path, &vae_device, DType::F32)?;
-    let latents = latents.to_device(&vae_device)?;
-    let latents_f32 = (latents.to_dtype(DType::F32)? / vae_scale)?;
+
+    match args.scheduler {
+        SamplerType::EulerA => info!("Scheduler: Euler Ancestral"),
+        SamplerType::EulerAKarras => info!("Scheduler: Euler Ancestral + Karras"),
+        SamplerType::Dpm2mKarras => info!("Scheduler: DPM++ 2M Karras"),
+    }
+
+    Ok(SdxlPrepared {
+        height,
+        width,
+        n_steps,
+        guidance_scale,
+        use_guide_scale,
+        scheduler_type: args.scheduler,
+        device: device.clone(),
+        dtype,
+        vae_device,
+        vae_scale: 0.18215f64,
+        text_embeddings,
+        unet,
+        vae,
+    })
+}
+
+fn generate_sdxl(p: &SdxlPrepared, args: &Args) -> Result<()> {
+    let mut scheduler: Box<dyn Scheduler> = match p.scheduler_type {
+        SamplerType::EulerA => Box::new(EulerAncestralDiscreteScheduler::new(
+            p.n_steps,
+            EulerAncestralDiscreteSchedulerConfig {
+                prediction_type: PredictionType::Epsilon,
+                ..Default::default()
+            },
+        )?),
+        SamplerType::EulerAKarras => Box::new(KarrasEulerAScheduler::new(p.n_steps)?),
+        SamplerType::Dpm2mKarras => Box::new(Dpm2mKarrasScheduler::new(p.n_steps)?),
+    };
+
+    let mut latents = (Tensor::randn(
+        0f32,
+        1f32,
+        (1usize, 4usize, p.height / 8, p.width / 8),
+        &p.device,
+    )? * scheduler.init_noise_sigma())?
+    .to_dtype(p.dtype)?;
+
+    let timesteps = scheduler.timesteps().to_vec();
+    let pb = crate::progress::denoising_bar(p.n_steps);
+    for (step, &timestep) in timesteps.iter().enumerate() {
+        let step_start = std::time::Instant::now();
+        let latent_input = if p.use_guide_scale {
+            Tensor::cat(&[&latents, &latents], 0)?
+        } else {
+            latents.clone()
+        };
+        let latent_input = scheduler.scale_model_input(latent_input, timestep)?;
+        let noise_pred = p
+            .unet
+            .forward(&latent_input, timestep as f64, &p.text_embeddings)?;
+        let noise_pred = if p.use_guide_scale {
+            let chunks = noise_pred.chunk(2, 0)?;
+            let (uncond, cond) = (&chunks[0], &chunks[1]);
+            (uncond + ((cond - uncond)? * p.guidance_scale)?)?
+        } else {
+            noise_pred
+        };
+        latents = scheduler.step(&noise_pred, timestep, &latents)?;
+        let dur = step_start.elapsed();
+        let eta = dur.as_secs_f32() * (p.n_steps.saturating_sub(step + 1)) as f32;
+        pb.set_message(format!("{:.1}s/step  ETA {:.0}s", dur.as_secs_f32(), eta));
+        pb.inc(1);
+    }
+    pb.finish_with_message("done");
+
+    let latents = latents.to_device(&p.vae_device)?;
+    let latents_f32 = (latents.to_dtype(DType::F32)? / p.vae_scale)?;
     let img = if args.vae_tile_size > 0 {
         let tile_size = args.vae_tile_size;
         let overlap = args.vae_tile_overlap;
         tracing::info!("Tiled VAE decode: tile={tile_size} overlap={overlap} (latent px)");
-        crate::vae_tiling::tiled_decode(&latents_f32, tile_size, overlap, height, width, |tile| {
-            Ok(vae.decode(tile)?)
-        })?
+        crate::vae_tiling::tiled_decode(
+            &latents_f32,
+            tile_size,
+            overlap,
+            p.height,
+            p.width,
+            |tile| Ok(p.vae.decode(tile)?),
+        )?
     } else {
-        vae.decode(&latents_f32)?
+        p.vae.decode(&latents_f32)?
     };
-    drop(vae);
     let img = img.to_device(&Device::Cpu)?;
     let img = ((img / 2.)? + 0.5)?.clamp(0f32, 1f32)?;
     let img = (img * 255.)?.to_dtype(DType::U8)?;

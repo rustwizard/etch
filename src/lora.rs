@@ -183,12 +183,11 @@ fn ldm_lora_base_to_unet_key(base: &str) -> Option<String> {
         let (m, s) = pop_num(s)?;
         let rest = s.strip_prefix('_').unwrap_or(s);
         (sdxl_output_block(n, m)?, rest)
-    } else if let Some(s) = base.strip_prefix("middle_block_") {
+    } else {
+        let s = base.strip_prefix("middle_block_")?;
         let (n, s) = pop_num(s)?;
         let rest = s.strip_prefix('_').unwrap_or(s);
         (sdxl_middle_block(n)?, rest)
-    } else {
-        return None;
     };
 
     let unet_path = if rest.is_empty() {

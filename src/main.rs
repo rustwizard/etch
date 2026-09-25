@@ -59,6 +59,10 @@ fn main() -> Result<()> {
     });
     info!("Dtype: {:?}", dtype);
 
+    // Load model weights once and reuse them across all seeds.
+    let mut pipeline = pipeline::for_model(args.model);
+    pipeline.prepare(&args, &device, dtype)?;
+
     for seed in seeds {
         info!("--- Seed: {seed} ({seed_source}) ---");
         if let Err(e) = device.set_seed(seed) {
@@ -78,7 +82,7 @@ fn main() -> Result<()> {
         };
 
         let t0 = std::time::Instant::now();
-        let result = pipeline::for_model(iter_args.model).run(&iter_args, &device, dtype);
+        let result = pipeline.generate(&iter_args);
         let out_path = iter_args.output.as_deref().expect("output set above");
         if let Err(e) = result {
             tracing::error!("Seed {seed} failed: {e}");

@@ -12,15 +12,42 @@ use tracing::info;
 use super::gguf::load_gguf;
 use super::model::FluxModel;
 
-pub struct FluxPipeline;
+/// Everything loaded once by `prepare` and reused by every `generate` call.
+struct FluxPrepared {
+    height: usize,
+    width: usize,
+    flux_device: Device,
+    vae_device: Device,
+    dtype: DType,
+    timesteps: Vec<f64>,
+    guidance: Option<Tensor>,
+    model: FluxModel,
+    vae: flux::autoencoder::AutoEncoder,
+    t5_emb: Tensor,
+    clip_emb: Tensor,
+}
+
+#[derive(Default)]
+pub struct FluxPipeline {
+    prepared: Option<FluxPrepared>,
+}
 
 impl crate::pipeline::Pipeline for FluxPipeline {
-    fn run(&self, args: &Args, device: &Device, dtype: DType) -> Result<()> {
-        run_flux_inner(args, device, dtype)
+    fn prepare(&mut self, args: &Args, device: &Device, dtype: DType) -> Result<()> {
+        self.prepared = Some(prepare_flux(args, device, dtype)?);
+        Ok(())
+    }
+
+    fn generate(&self, args: &Args) -> Result<()> {
+        let p = self
+            .prepared
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("FLUX pipeline not prepared"))?;
+        generate_flux(p, args)
     }
 }
 
-fn run_flux_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
+fn prepare_flux(args: &Args, device: &Device, dtype: DType) -> Result<FluxPrepared> {
     let height = args.height.unwrap_or(768);
     let width = args.width.unwrap_or(1360);
     anyhow::ensure!(
@@ -78,94 +105,58 @@ fn run_flux_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     info!("CLIP: {:?}", clip_emb.shape());
 
     // FLUX DiT
-    let img = {
-        let cfg = match args.model {
-            Model::Dev | Model::DevGguf => flux::model::Config::dev(),
-            _ => flux::model::Config::schnell(),
+    let cfg = match args.model {
+        Model::Dev | Model::DevGguf => flux::model::Config::dev(),
+        _ => flux::model::Config::schnell(),
+    };
+    let n_steps = args.n_steps.unwrap_or(match args.model {
+        Model::Dev | Model::DevGguf => 50,
+        _ => 4,
+    });
+    let timesteps = match args.model {
+        Model::Dev | Model::DevGguf => {
+            flux::sampling::get_schedule(n_steps, Some((height, 0.5, 1.15)))
+        }
+        _ => flux::sampling::get_schedule(n_steps, None),
+    };
+    let model = if let Some(gguf_path) = &args.gguf {
+        crate::hub::log_model_size(std::path::Path::new(gguf_path), "FLUX DiT (GGUF)");
+        let vb = load_gguf(gguf_path, gguf_path)?;
+        FluxModel::Quantized(Box::new(flux::quantized_model::Flux::new(&cfg, vb)?))
+    } else if matches!(args.model, Model::SchnellGguf | Model::DevGguf) {
+        let q = match args.quantization {
+            Quantization::Q8 => "Q8_0",
+            Quantization::Q4 => "Q4_K_S",
         };
-        let img = flux::sampling::get_noise(1, height, width, &flux_device)?.to_dtype(dtype)?;
-        let state = flux::sampling::State::new(&t5_emb, &clip_emb, &img)?;
-        let n_steps = args.n_steps.unwrap_or(match args.model {
-            Model::Dev | Model::DevGguf => 50,
-            _ => 4,
-        });
-        let timesteps = match args.model {
-            Model::Dev | Model::DevGguf => {
-                flux::sampling::get_schedule(n_steps, Some((state.img.dim(1)?, 0.5, 1.15)))
-            }
-            _ => flux::sampling::get_schedule(n_steps, None),
+        let (gguf_repo, gguf_file) = match args.model {
+            Model::DevGguf => ("city96/FLUX.1-dev-gguf", format!("flux1-dev-{q}.gguf")),
+            _ => (
+                "city96/FLUX.1-schnell-gguf",
+                format!("flux1-schnell-{q}.gguf"),
+            ),
         };
-        let model = if let Some(gguf_path) = &args.gguf {
-            crate::hub::log_model_size(std::path::Path::new(gguf_path), "FLUX DiT (GGUF)");
-            let vb = load_gguf(gguf_path, gguf_path)?;
-            FluxModel::Quantized(Box::new(flux::quantized_model::Flux::new(&cfg, vb)?))
-        } else if matches!(args.model, Model::SchnellGguf | Model::DevGguf) {
-            let q = match args.quantization {
-                Quantization::Q8 => "Q8_0",
-                Quantization::Q4 => "Q4_K_S",
-            };
-            let (gguf_repo, gguf_file) = match args.model {
-                Model::DevGguf => ("city96/FLUX.1-dev-gguf", format!("flux1-dev-{q}.gguf")),
-                _ => (
-                    "city96/FLUX.1-schnell-gguf",
-                    format!("flux1-schnell-{q}.gguf"),
-                ),
-            };
-            let gguf_file = gguf_file.as_str();
-            let gguf_hf_repo = api.repo(hf_hub::Repo::model(gguf_repo.to_string()));
-            let path = crate::hub::fetch(&gguf_hf_repo, gguf_file)?;
-            crate::hub::log_model_size(&path, "FLUX DiT (GGUF)");
-            let vb = load_gguf(&path, gguf_file)?;
-            FluxModel::Quantized(Box::new(flux::quantized_model::Flux::new(&cfg, vb)?))
-        } else {
-            let model_file = match args.model {
-                Model::Dev => crate::hub::fetch(&bf_repo, "flux1-dev.safetensors")?,
-                _ => crate::hub::fetch(&bf_repo, "flux1-schnell.safetensors")?,
-            };
-            crate::hub::log_model_size(&model_file, "FLUX DiT");
-            // SAFETY: file is owned by the HF cache and not modified during inference.
-            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[model_file], dtype, device)? };
-            FluxModel::Full(Box::new(flux::model::Flux::new(&cfg, vb)?))
+        let gguf_file = gguf_file.as_str();
+        let gguf_hf_repo = api.repo(hf_hub::Repo::model(gguf_repo.to_string()));
+        let path = crate::hub::fetch(&gguf_hf_repo, gguf_file)?;
+        crate::hub::log_model_size(&path, "FLUX DiT (GGUF)");
+        let vb = load_gguf(&path, gguf_file)?;
+        FluxModel::Quantized(Box::new(flux::quantized_model::Flux::new(&cfg, vb)?))
+    } else {
+        let model_file = match args.model {
+            Model::Dev => crate::hub::fetch(&bf_repo, "flux1-dev.safetensors")?,
+            _ => crate::hub::fetch(&bf_repo, "flux1-schnell.safetensors")?,
         };
-        let denoised = {
-            let n_steps = timesteps.len().saturating_sub(1);
-            let b_sz = state.img.dim(0)?;
-            // schnell is a distilled model — guidance embedding is absent from its weights.
-            // dev has guidance conditioning; a separate CLI flag keeps it from clashing
-            // with --guidance-scale (SDXL) which uses a very different scale (7.5 vs 3.5).
-            let guidance = match args.model {
-                Model::Schnell | Model::SchnellGguf => None,
-                _ => Some(Tensor::full(args.flux_guidance as f32, b_sz, &flux_device)?),
-            };
-            let mut img = state.img.clone();
-            let pb = crate::progress::denoising_bar(n_steps);
-            for (step, window) in timesteps.windows(2).enumerate() {
-                let (t_curr, t_prev) = (window[0], window[1]);
-                let t_vec = Tensor::full(t_curr as f32, b_sz, &flux_device)?;
-                let step_start = std::time::Instant::now();
-                let pred = flux::WithForward::forward(
-                    &model,
-                    &img,
-                    &state.img_ids,
-                    &state.txt,
-                    &state.txt_ids,
-                    &t_vec,
-                    &state.vec,
-                    guidance.as_ref(),
-                )?;
-                img = (img + (pred * (t_prev - t_curr))?)?;
-                let dur = step_start.elapsed();
-                let eta = dur.as_secs_f32() * (n_steps.saturating_sub(step + 1)) as f32;
-                pb.set_message(format!("{:.1}s/step  ETA {:.0}s", dur.as_secs_f32(), eta));
-                pb.inc(1);
-            }
-            pb.finish_with_message("done");
-            img
-        };
-        let unpacked = flux::sampling::unpack(&denoised, height, width)?;
-        drop(model);
-        drop(state);
-        unpacked.to_device(device)?
+        crate::hub::log_model_size(&model_file, "FLUX DiT");
+        // SAFETY: file is owned by the HF cache and not modified during inference.
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[model_file], dtype, device)? };
+        FluxModel::Full(Box::new(flux::model::Flux::new(&cfg, vb)?))
+    };
+    // schnell is a distilled model — guidance embedding is absent from its weights.
+    // dev has guidance conditioning; a separate CLI flag keeps it from clashing
+    // with --guidance-scale (SDXL) which uses a very different scale (7.5 vs 3.5).
+    let guidance = match args.model {
+        Model::Schnell | Model::SchnellGguf => None,
+        _ => Some(Tensor::full(args.flux_guidance as f32, 1, &flux_device)?),
     };
 
     // VAE decode — always F32 for stable decode regardless of model dtype.
@@ -175,28 +166,77 @@ fn run_flux_inner(args: &Args, device: &Device, dtype: DType) -> Result<()> {
     } else {
         device.clone()
     };
-    let img = img.to_device(&vae_device)?;
-    let img = {
-        let ae_path = crate::hub::fetch(&bf_repo, "ae.safetensors")?;
-        crate::hub::log_model_size(&ae_path, "VAE");
-        // SAFETY: file is owned by the HF cache and not modified during inference.
-        let vb =
-            unsafe { VarBuilder::from_mmaped_safetensors(&[ae_path], DType::F32, &vae_device)? };
-        let cfg = match args.model {
-            Model::Dev | Model::DevGguf => flux::autoencoder::Config::dev(),
-            _ => flux::autoencoder::Config::schnell(),
-        };
-        let vae = flux::autoencoder::AutoEncoder::new(&cfg, vb)?;
-        if args.vae_tile_size > 0 {
-            let tile_size = args.vae_tile_size;
-            let overlap = args.vae_tile_overlap;
-            tracing::info!("Tiled VAE decode: tile={tile_size} overlap={overlap} (latent px)");
-            crate::vae_tiling::tiled_decode(&img, tile_size, overlap, height, width, |tile| {
-                Ok(vae.decode(tile)?)
-            })?
-        } else {
-            vae.decode(&img)?
+    let ae_path = crate::hub::fetch(&bf_repo, "ae.safetensors")?;
+    crate::hub::log_model_size(&ae_path, "VAE");
+    // SAFETY: file is owned by the HF cache and not modified during inference.
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[ae_path], DType::F32, &vae_device)? };
+    let vae_cfg = match args.model {
+        Model::Dev | Model::DevGguf => flux::autoencoder::Config::dev(),
+        _ => flux::autoencoder::Config::schnell(),
+    };
+    let vae = flux::autoencoder::AutoEncoder::new(&vae_cfg, vb)?;
+
+    Ok(FluxPrepared {
+        height,
+        width,
+        flux_device,
+        vae_device,
+        dtype,
+        timesteps,
+        guidance,
+        model,
+        vae,
+        t5_emb,
+        clip_emb,
+    })
+}
+
+fn generate_flux(p: &FluxPrepared, args: &Args) -> Result<()> {
+    let img = flux::sampling::get_noise(1, p.height, p.width, &p.flux_device)?.to_dtype(p.dtype)?;
+    let state = flux::sampling::State::new(&p.t5_emb, &p.clip_emb, &img)?;
+    let denoised = {
+        let n_steps = p.timesteps.len().saturating_sub(1);
+        let b_sz = state.img.dim(0)?;
+        let mut img = state.img.clone();
+        let pb = crate::progress::denoising_bar(n_steps);
+        for (step, window) in p.timesteps.windows(2).enumerate() {
+            let (t_curr, t_prev) = (window[0], window[1]);
+            let t_vec = Tensor::full(t_curr as f32, b_sz, &p.flux_device)?;
+            let step_start = std::time::Instant::now();
+            let pred = flux::WithForward::forward(
+                &p.model,
+                &img,
+                &state.img_ids,
+                &state.txt,
+                &state.txt_ids,
+                &t_vec,
+                &state.vec,
+                p.guidance.as_ref(),
+            )?;
+            img = (img + (pred * (t_prev - t_curr))?)?;
+            let dur = step_start.elapsed();
+            let eta = dur.as_secs_f32() * (n_steps.saturating_sub(step + 1)) as f32;
+            pb.set_message(format!("{:.1}s/step  ETA {:.0}s", dur.as_secs_f32(), eta));
+            pb.inc(1);
         }
+        pb.finish_with_message("done");
+        img
+    };
+    drop(state);
+    let unpacked = flux::sampling::unpack(&denoised, p.height, p.width)?;
+    // The VAE decoder weights are always F32; cast the latent to match. Without
+    // this, BF16 latents from Metal inference fail with a conv2d dtype mismatch.
+    let img = unpacked.to_device(&p.vae_device)?.to_dtype(DType::F32)?;
+
+    let img = if args.vae_tile_size > 0 {
+        let tile_size = args.vae_tile_size;
+        let overlap = args.vae_tile_overlap;
+        tracing::info!("Tiled VAE decode: tile={tile_size} overlap={overlap} (latent px)");
+        crate::vae_tiling::tiled_decode(&img, tile_size, overlap, p.height, p.width, |tile| {
+            Ok(p.vae.decode(tile)?)
+        })?
+    } else {
+        p.vae.decode(&img)?
     };
 
     let img = img.to_device(&Device::Cpu)?;
