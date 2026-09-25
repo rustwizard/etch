@@ -79,7 +79,15 @@ fn prepare_flux(args: &Args, device: &Device, dtype: DType) -> Result<FluxPrepar
     };
 
     let cache = EmbeddingCache::new(EmbeddingCache::default_dir());
-    let cache_key = CacheKey::from_parts(&["flux", &format!("{:?}", args.model), &args.prompt]);
+    // dtype affects the cached embedding layout (bf16 vs f32); include it so a
+    // run with a different --dtype does not reuse mismatched tensors.
+    let dtype_key = format!("{dtype:?}");
+    let cache_key = CacheKey::from_parts(&[
+        "flux",
+        &format!("{:?}", args.model),
+        &args.prompt,
+        &dtype_key,
+    ]);
 
     let (t5_emb, clip_emb) = if let Some(mut cached) = cache
         .get(&cache_key, &["t5_emb", "clip_emb"], &flux_device)

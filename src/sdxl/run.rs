@@ -152,8 +152,19 @@ fn prepare_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<SdxlPrepar
         } else {
             None
         };
+        // Embeddings differ by CFG batch layout (uncond+cond vs cond-only) and by
+        // compute dtype; both must be part of the key or cached tensors from a
+        // different configuration collide (e.g. batch-1 emb fed to a batch-2 run).
+        let cfg_key = if use_guide_scale { "cfg2" } else { "cfg1" };
+        let dtype_key = format!("{dtype:?}");
         let parts: Vec<&str> = {
-            let mut v: Vec<&str> = vec!["sdxl", &args.prompt, &args.uncond_prompt];
+            let mut v: Vec<&str> = vec![
+                "sdxl",
+                &args.prompt,
+                &args.uncond_prompt,
+                cfg_key,
+                &dtype_key,
+            ];
             if let Some(ref lk) = lora_key {
                 v.push(lk);
             }
