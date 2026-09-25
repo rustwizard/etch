@@ -224,7 +224,9 @@ fn generate_flux(p: &FluxPrepared, args: &Args) -> Result<()> {
     };
     drop(state);
     let unpacked = flux::sampling::unpack(&denoised, p.height, p.width)?;
-    let img = unpacked.to_device(&p.vae_device)?;
+    // The VAE decoder weights are always F32; cast the latent to match. Without
+    // this, BF16 latents from Metal inference fail with a conv2d dtype mismatch.
+    let img = unpacked.to_device(&p.vae_device)?.to_dtype(DType::F32)?;
 
     let img = if args.vae_tile_size > 0 {
         let tile_size = args.vae_tile_size;
