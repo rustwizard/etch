@@ -11,9 +11,9 @@ metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 cuda  = ["candle-core/cuda",  "candle-nn/cuda",  "candle-transformers/cuda"]
 
 [dependencies]
-candle-core = { version = "0.10" }
-candle-nn = { version = "0.10" }
-candle-transformers = { version = "0.10" }
+candle-core = { version = "0.11" }
+candle-nn = { version = "0.11" }
+candle-transformers = { version = "0.11" }
 hf-hub = { version = "0.4", features = ["tokio"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 anyhow = "1"
