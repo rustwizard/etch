@@ -12,6 +12,7 @@ mod pipeline;
 mod progress;
 mod schedulers;
 mod sdxl;
+mod signals;
 mod vae_tiling;
 
 use cli::Args;
@@ -27,6 +28,7 @@ fn main() -> Result<()> {
         !(args.seed.is_some() && args.seed_range.is_some()),
         "--seed and --seed-range are mutually exclusive"
     );
+    signals::install();
 
     let builder = tracing_subscriber::fmt().with_env_filter(
         tracing_subscriber::EnvFilter::try_from_default_env()
@@ -64,6 +66,10 @@ fn main() -> Result<()> {
     pipeline.prepare(&args, &device, dtype)?;
 
     for seed in seeds {
+        if signals::interrupted() {
+            info!("Interrupted — stopping before seed {seed}");
+            std::process::exit(130);
+        }
         info!("--- Seed: {seed} ({seed_source}) ---");
         if let Err(e) = device.set_seed(seed) {
             tracing::warn!("Failed to set seed {seed}: {e}");
@@ -85,6 +91,10 @@ fn main() -> Result<()> {
         let result = pipeline.generate(&iter_args);
         let out_path = iter_args.output.as_deref().expect("output set above");
         if let Err(e) = result {
+            if signals::interrupted() {
+                info!("Interrupted during seed {seed} — stopping");
+                std::process::exit(130);
+            }
             tracing::error!("Seed {seed} failed: {e}");
             if let Err(log_err) = logger::write_log_failure(out_path, &iter_args, seed, &e) {
                 tracing::warn!("Failed to write failure log: {log_err}");
