@@ -8,6 +8,8 @@ Text-to-image generation using [Candle](https://github.com/huggingface/candle). 
 |------|-------|------|-------|---------|
 | `--model schnell` | FLUX.1-schnell | ~25 GB | 4 | Apache 2.0 |
 | `--model dev` | FLUX.1-dev | ~25 GB | 50 | Non-commercial |
+| `--model schnell-gguf` | FLUX.1-schnell (GGUF, quantized) | 7–12 GB | 4 | Apache 2.0 |
+| `--model dev-gguf` | FLUX.1-dev (GGUF, quantized) | 7–12 GB | 50 | Non-commercial |
 | `--model araminta` | the-araminta-experiment-fv5-sdxl | ~7 GB | 20 | — |
 
 Weights are downloaded automatically from HuggingFace Hub on first run and cached in `~/.cache/huggingface/`.
@@ -23,7 +25,8 @@ Weights are downloaded automatically from HuggingFace Hub on first run and cache
 
 | Model | Minimum | Comfortable |
 |-------|---------|-------------|
-| FLUX.1-schnell / dev | 32 GB | 64 GB |
+| FLUX.1-schnell / dev (safetensors) | 32 GB | 64 GB |
+| FLUX.1 schnell-gguf / dev-gguf (q8 / q4) | 16 GB | 24 GB |
 | Araminta (SDXL) | 16 GB | 24 GB |
 
 FLUX loads ~36 GB of weights in total (DiT + T5-XXL + CLIP) in F32. On 32 GB machines it will swap during the run. Use `--dtype bf16` (default on Metal) to halve memory usage, or `--model schnell-gguf` for ~12 GB.
@@ -53,6 +56,8 @@ cargo build --release
 ```
 
 > **WSL2 tip:** If build fails with OOM, limit parallel jobs: `CARGO_BUILD_JOBS=1 cargo build --release --features cuda`
+
+> **Note:** `metal` and `cuda` are mutually exclusive — enabling both fails the build with an explicit error. Pick the one that matches your hardware.
 
 ## Usage
 
@@ -96,6 +101,10 @@ Generate multiple images sequentially, iterating through seeds:
 ```
 
 This creates `out/batch-0.png`, `out/batch-1.png`, … `out/batch-100.png`. Each generation starts only after the previous image is saved. If one fails, the batch continues with the next seed.
+
+Model weights are loaded **once** for the whole batch and reused across seeds — per-image time after the first is pure denoising + VAE decode.
+
+**Interrupting:** the first `Ctrl-C` stops the batch gracefully at the next denoising step (exit code 130, already-saved images and log entries are kept); a second `Ctrl-C` quits immediately.
 
 ### With LoRA
 
@@ -156,7 +165,7 @@ pipe.save_pretrained("/path/to/sdxl-diffusers")
 | `--clip-skip` | `1` | CLIP layers to skip from end (SDXL only) |
 | `--seed` | random | Random seed for reproducibility |
 | `--seed-range` | — | Batch mode: `START-END`, e.g. `0-100` |
-| `--output` | `out-<rand>.png` | Output file path |
+| `--output` | `out/out-<seed>-<rand>.png` | Output file path (when set, `-<seed>` is inserted before the extension) |
 | `--lora` | — | Path to LoRA `.safetensors` (SDXL only) |
 | `--lora-scale` | `1.0` | LoRA strength |
 | `--local-model` | — | Local diffusers model dir (SDXL only, overrides HF download) |
@@ -200,7 +209,7 @@ Metal uses an internal memory pool and does not return GPU memory to the OS unti
 | `--cpu` | Skip GPU entirely (much slower, no pool overhead) |
 | `--model araminta` | Smallest model, ~7 GB |
 
-**Embedding cache:** repeated runs with the same prompt skip loading T5/CLIP encoders entirely — saved as safetensors in `~/.cache/etch/embeddings/`. Changes to `--prompt`, `--clip-skip`, `--lora`, or model invalidate the cache automatically.
+**Embedding cache:** repeated runs with the same prompt skip loading T5/CLIP encoders entirely — saved as safetensors in `~/.cache/etch/embeddings/`. Changes to `--prompt`, `--clip-skip`, `--lora`, `--dtype`, guidance mode (`--guidance-scale` above/below 1, SDXL), or model invalidate the cache automatically.
 
 ### CUDA out of memory on VAE decode
 
@@ -227,7 +236,7 @@ GGUF runs the DiT on CPU. Add `--vae-tile-size 64` (`128` for ≥768 px) to avoi
 
 This is a characteristic of the Araminta model, not a bug. A few ways to get more variety:
 
-**Set an explicit seed** — without `--seed` the generator initializes the same way every run:
+**Set an explicit seed** — without `--seed` a random seed is picked each run (results vary, but are not reproducible). An explicit seed makes a run repeatable:
 ```bash
 --seed 1234
 --seed 9999
