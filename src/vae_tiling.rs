@@ -39,6 +39,14 @@ pub fn tiled_decode(
 
     let mut output = Tensor::zeros((1, 3, output_h, output_w), DType::F32, device)?;
 
+    // Feather masks repeat across the grid: every interior tile shares one
+    // mask, and edge/corner tiles repeat along rows and columns. Cache them
+    // by (out_h, out_w, feather bits) to avoid recomputing the CPU loop and
+    // re-uploading to the device for every tile. Overlap sizes are constant
+    // within a single call, so they need not be part of the key.
+    let mut weight_cache: std::collections::HashMap<(usize, usize, u8), Tensor> =
+        std::collections::HashMap::new();
+
     let mut y0 = 0usize;
     while y0 < h {
         let y1 = (y0 + tile_size).min(h);
@@ -63,19 +71,31 @@ pub fn tiled_decode(
             let out_h = ty_h * scale_h;
             let out_w = tx_w * scale_w;
 
-            let weight = tile_weight(
-                &TileParams {
-                    h: out_h,
-                    w: out_w,
-                    overlap_h: overlap_out_h,
-                    overlap_w: overlap_out_w,
-                    feather_left,
-                    feather_top,
-                    feather_right,
-                    feather_bottom,
-                },
-                device,
-            )?;
+            let feather_bits = (feather_left as u8)
+                | (feather_top as u8) << 1
+                | (feather_right as u8) << 2
+                | (feather_bottom as u8) << 3;
+            let cache_key = (out_h, out_w, feather_bits);
+            let weight = match weight_cache.get(&cache_key) {
+                Some(w) => w.clone(),
+                None => {
+                    let w = tile_weight(
+                        &TileParams {
+                            h: out_h,
+                            w: out_w,
+                            overlap_h: overlap_out_h,
+                            overlap_w: overlap_out_w,
+                            feather_left,
+                            feather_top,
+                            feather_right,
+                            feather_bottom,
+                        },
+                        device,
+                    )?;
+                    weight_cache.insert(cache_key, w.clone());
+                    w
+                }
+            };
 
             let weighted = tile_decoded.broadcast_mul(&weight)?;
             let region = output.narrow(2, out_y0, out_h)?.narrow(3, out_x0, out_w)?;
