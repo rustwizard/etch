@@ -46,11 +46,18 @@ fn write_entry(
             entry["uncond_prompt"] = serde_json::json!(args.uncond_prompt);
         }
     }
+    // Build the full line first, then issue a single write_all. The file is
+    // opened with append(true): O_APPEND on POSIX (atomic seek-to-end + write)
+    // and FILE_APPEND_DATA on Windows — both guarantee concurrent appends do
+    // not interleave. writeln! would not: its formatting adaptor can split the
+    // line across multiple write syscalls, letting parallel runs corrupt the
+    // log mid-line.
+    let line = format!("{entry}\n");
     let mut log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)?;
     use std::io::Write as _;
-    writeln!(log, "{}", entry)?;
+    log.write_all(line.as_bytes())?;
     Ok(())
 }
