@@ -1,5 +1,13 @@
 use candle_core::Device;
 
+// Without this guard, enabling both features would silently prefer Metal due
+// to the cfg ordering below, even on a CUDA-only machine.
+#[cfg(all(feature = "metal", feature = "cuda"))]
+compile_error!(
+    "features `metal` and `cuda` are mutually exclusive: pick exactly one GPU backend \
+     (`--features metal` on Apple Silicon, `--features cuda` on NVIDIA)"
+);
+
 pub fn pick_device(cpu: bool) -> Device {
     if cpu {
         return Device::Cpu;
