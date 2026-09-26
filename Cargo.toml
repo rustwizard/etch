@@ -26,6 +26,7 @@ tokenizers = "0.21"
 indicatif = "0.17"
 sha2 = "0.10"
 dirs = "5"
+ctrlc = "3"
 
 [profile.release]
 opt-level = 3

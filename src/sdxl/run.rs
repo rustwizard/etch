@@ -325,6 +325,10 @@ fn generate_sdxl(p: &SdxlPrepared, args: &Args) -> Result<()> {
     let timesteps = scheduler.timesteps().to_vec();
     let pb = crate::progress::denoising_bar(p.n_steps);
     for (step, &timestep) in timesteps.iter().enumerate() {
+        if crate::signals::interrupted() {
+            pb.finish_and_clear();
+            anyhow::bail!("interrupted by user");
+        }
         let step_start = std::time::Instant::now();
         let latent_input = if p.use_guide_scale {
             Tensor::cat(&[&latents, &latents], 0)?

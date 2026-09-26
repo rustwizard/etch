@@ -208,6 +208,10 @@ fn generate_flux(p: &FluxPrepared, args: &Args) -> Result<()> {
         let mut img = state.img.clone();
         let pb = crate::progress::denoising_bar(n_steps);
         for (step, window) in p.timesteps.windows(2).enumerate() {
+            if crate::signals::interrupted() {
+                pb.finish_and_clear();
+                anyhow::bail!("interrupted by user");
+            }
             let (t_curr, t_prev) = (window[0], window[1]);
             let t_vec = Tensor::full(t_curr as f32, b_sz, &p.flux_device)?;
             let step_start = std::time::Instant::now();
