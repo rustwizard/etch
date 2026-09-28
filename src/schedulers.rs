@@ -21,8 +21,15 @@ pub(crate) fn build_sdxl_sigmas(n_steps: usize) -> (Vec<f64>, f64, f64) {
         .collect();
 
     let step_ratio = TRAIN_STEPS / n_steps;
-    let sigma_max = all_sigmas[(n_steps - 1) * step_ratio + STEPS_OFFSET];
-    let sigma_min = all_sigmas[step_ratio + STEPS_OFFSET];
+    // Clamp indices: for n_steps=1 the raw index (step_ratio + STEPS_OFFSET)
+    // is 1001, past the end of the 1000-entry table. The schedule degenerates
+    // (sigma_min = sigma_max) but must not panic and must stay ordered.
+    let min_idx = (step_ratio + STEPS_OFFSET).min(TRAIN_STEPS - 1);
+    let max_idx = ((n_steps - 1) * step_ratio + STEPS_OFFSET)
+        .min(TRAIN_STEPS - 1)
+        .max(min_idx);
+    let sigma_max = all_sigmas[max_idx];
+    let sigma_min = all_sigmas[min_idx];
     (all_sigmas, sigma_max, sigma_min)
 }
 
@@ -238,5 +245,77 @@ impl Scheduler for Dpm2mKarrasScheduler {
     ) -> candle_core::Result<Tensor> {
         let i = timestep_index(&self.timesteps, timestep)?;
         original + (noise * self.sigmas[i])?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_step_does_not_panic() {
+        // n_steps=1 pushes the min index past the 1000-entry table; clamping
+        // must keep it in bounds and the schedule ordered.
+        let (all_sigmas, sigma_max, sigma_min) = build_sdxl_sigmas(1);
+        assert!(sigma_max >= sigma_min);
+        let (sigmas, timesteps) = build_karras_schedule(1, &all_sigmas, sigma_max, sigma_min);
+        assert_eq!(sigmas.len(), 2); // one step + terminal 0.0
+        assert_eq!(sigmas[1], 0.0);
+        assert_eq!(timesteps.len(), 1);
+    }
+
+    #[test]
+    fn karras_sigmas_decrease_to_zero() {
+        for n_steps in [2, 4, 20, 30, 50, 1000] {
+            let (all_sigmas, sigma_max, sigma_min) = build_sdxl_sigmas(n_steps);
+            let (sigmas, _) = build_karras_schedule(n_steps, &all_sigmas, sigma_max, sigma_min);
+            assert_eq!(sigmas.len(), n_steps + 1, "n_steps={n_steps}");
+            assert_eq!(*sigmas.last().expect("non-empty"), 0.0);
+            assert!(sigmas[0] > 0.0, "n_steps={n_steps}");
+            for w in sigmas.windows(2) {
+                // Non-strict: for small n_steps (e.g. 2) sigma_max == sigma_min
+                // by construction of the timestep spacing, so the leading
+                // sigmas can be equal. Strict decrease holds for typical counts.
+                assert!(
+                    w[0] >= w[1],
+                    "sigmas must not increase (n_steps={n_steps}): {} < {}",
+                    w[0],
+                    w[1]
+                );
+            }
+            if n_steps >= 4 {
+                for w in sigmas[..n_steps].windows(2) {
+                    assert!(w[0] > w[1], "strict decrease expected (n_steps={n_steps})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sigma_bounds_are_ordered_and_positive() {
+        for n_steps in [1, 2, 20, 50] {
+            let (_, sigma_max, sigma_min) = build_sdxl_sigmas(n_steps);
+            assert!(sigma_min > 0.0, "n_steps={n_steps}");
+            assert!(sigma_max >= sigma_min, "n_steps={n_steps}");
+        }
+    }
+
+    #[test]
+    fn timesteps_map_into_training_range() {
+        let (all_sigmas, sigma_max, sigma_min) = build_sdxl_sigmas(20);
+        let (_, timesteps) = build_karras_schedule(20, &all_sigmas, sigma_max, sigma_min);
+        for t in timesteps {
+            assert!(t < 1000, "timestep {t} outside training range");
+        }
+    }
+
+    #[test]
+    fn sigma_to_t_picks_nearest() {
+        let grid = [0.0, 1.0, 2.0, 3.0];
+        assert_eq!(sigma_to_t(0.4, &grid), 0);
+        assert_eq!(sigma_to_t(0.6, &grid), 1);
+        assert_eq!(sigma_to_t(2.5, &grid), 2); // tie goes to the lower index
+        assert_eq!(sigma_to_t(99.0, &grid), 3);
+        assert_eq!(sigma_to_t(-99.0, &grid), 0);
     }
 }
