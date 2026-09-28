@@ -222,6 +222,16 @@ pub fn ignored_flag_warnings(args: &Args) -> Vec<String> {
     w
 }
 
+/// Upper bound for `--seed-range` batch size: the range is materialized as a
+/// Vec<u64>, so an unbounded range (e.g. 0-u64::MAX) would OOM before any
+/// image is generated.
+pub const MAX_BATCH_SEEDS: u64 = 100_000;
+
+/// Upper bound for `--n-steps`. The SDXL Karras schedulers derive their sigma
+/// schedule from TRAIN_STEPS=1000 discrete steps; beyond that the schedule
+/// degenerates (step_ratio becomes 0). Also guards against typos.
+pub const MAX_N_STEPS: usize = 1000;
+
 pub fn parse_seed_range(s: &str) -> Result<Vec<u64>> {
     let parts: Vec<&str> = s.split('-').collect();
     if parts.len() != 2 {
@@ -236,7 +246,26 @@ pub fn parse_seed_range(s: &str) -> Result<Vec<u64>> {
     if end < start {
         anyhow::bail!("seed-range end must be >= start");
     }
+    // saturating: end - start + 1 overflows for start=0, end=u64::MAX
+    let count = end.saturating_sub(start).saturating_add(1);
+    anyhow::ensure!(
+        count <= MAX_BATCH_SEEDS,
+        "seed-range {s} contains {count} seeds, maximum is {MAX_BATCH_SEEDS}"
+    );
     Ok((start..=end).collect())
+}
+
+/// Validate `--n-steps` early, before any model weights are loaded.
+/// n_steps=0 would divide by zero in the SDXL sigma schedule.
+pub fn validate_n_steps(n_steps: Option<usize>) -> Result<()> {
+    if let Some(n) = n_steps {
+        anyhow::ensure!(n >= 1, "--n-steps must be at least 1, got {n}");
+        anyhow::ensure!(
+            n <= MAX_N_STEPS,
+            "--n-steps {n} exceeds maximum of {MAX_N_STEPS}"
+        );
+    }
+    Ok(())
 }
 
 pub fn output_for_seed(base: &Option<String>, seed: u64) -> String {
@@ -338,6 +367,49 @@ mod tests {
         let w = warnings(&["--model", "schnell", "--flux-guidance", "2.0"]);
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("distilled"));
+    }
+
+    #[test]
+    fn seed_range_parses_inclusive() {
+        assert_eq!(parse_seed_range("3-5").expect("valid range"), vec![3, 4, 5]);
+        assert_eq!(parse_seed_range("7-7").expect("single seed"), vec![7]);
+    }
+
+    #[test]
+    fn seed_range_rejects_bad_input() {
+        assert!(parse_seed_range("5").is_err());
+        assert!(parse_seed_range("1-2-3").is_err());
+        assert!(parse_seed_range("a-b").is_err());
+        assert!(parse_seed_range("5-3").is_err());
+    }
+
+    #[test]
+    fn seed_range_rejects_oversized_batches() {
+        // u64::MAX - 0 + 1 would overflow a naive count; saturating math must
+        // catch it and error instead of OOM-collecting the range.
+        let err =
+            parse_seed_range("0-18446744073709551615").expect_err("huge range must be rejected");
+        assert!(err.to_string().contains("maximum"), "{err}");
+        let over = format!("0-{}", MAX_BATCH_SEEDS); // MAX_BATCH_SEEDS + 1 seeds
+        assert!(parse_seed_range(&over).is_err());
+        let ok = format!("0-{}", MAX_BATCH_SEEDS - 1); // exactly the limit
+        assert_eq!(
+            parse_seed_range(&ok)
+                .expect("limit must be inclusive")
+                .len() as u64,
+            MAX_BATCH_SEEDS
+        );
+    }
+
+    #[test]
+    fn n_steps_validation() {
+        assert!(validate_n_steps(None).is_ok());
+        assert!(validate_n_steps(Some(1)).is_ok());
+        assert!(validate_n_steps(Some(20)).is_ok());
+        assert!(validate_n_steps(Some(MAX_N_STEPS)).is_ok());
+        let zero = validate_n_steps(Some(0)).expect_err("0 must be rejected");
+        assert!(zero.to_string().contains("at least 1"), "{zero}");
+        assert!(validate_n_steps(Some(MAX_N_STEPS + 1)).is_err());
     }
 
     #[test]

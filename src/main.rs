@@ -28,6 +28,7 @@ fn main() -> Result<()> {
         !(args.seed.is_some() && args.seed_range.is_some()),
         "--seed and --seed-range are mutually exclusive"
     );
+    cli::validate_n_steps(args.n_steps)?;
     signals::install();
 
     let builder = tracing_subscriber::fmt().with_env_filter(
