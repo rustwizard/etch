@@ -164,6 +164,64 @@ pub enum Model {
     Araminta,
 }
 
+/// Collect warnings about flags that the selected model silently ignores.
+/// Pure function so it can be unit-tested; `main` logs each returned line.
+///
+/// Flags with defaults can only be detected when set to a non-default value
+/// (clap does not track explicitness here), so e.g. `--guidance-scale 7.5`
+/// with a FLUX model passes silently — the value is ignored either way.
+pub fn ignored_flag_warnings(args: &Args) -> Vec<String> {
+    let mut w = Vec::new();
+    let is_sdxl = args.model == Model::Araminta;
+    let is_schnell = matches!(args.model, Model::Schnell | Model::SchnellGguf);
+
+    if !is_sdxl {
+        if args.lora.is_some() {
+            w.push("--lora is SDXL-only and ignored by FLUX models".into());
+        }
+        if args.local_model.is_some() {
+            w.push("--local-model is SDXL-only and ignored by FLUX models".into());
+        }
+        if !args.uncond_prompt.is_empty() {
+            w.push("--uncond-prompt is SDXL-only and ignored by FLUX models".into());
+        }
+        if args.guidance_scale != 7.5 {
+            w.push("--guidance-scale is SDXL-only and ignored by FLUX models (FLUX dev uses --flux-guidance)".into());
+        }
+        if args.scheduler != SamplerType::EulerA {
+            w.push("--scheduler is SDXL-only and ignored by FLUX models".into());
+        }
+        if args.clip_skip != 1 {
+            w.push("--clip-skip is SDXL-only and ignored by FLUX models".into());
+        }
+        if is_schnell && args.flux_guidance != 3.5 {
+            w.push(
+                "--flux-guidance is ignored: schnell is distilled and runs without guidance".into(),
+            );
+        }
+    } else {
+        if args.gguf.is_some() {
+            w.push("--gguf is FLUX-only and ignored by SDXL".into());
+        }
+        if args.sequential_te {
+            w.push("--sequential-te is FLUX-only and ignored by SDXL".into());
+        }
+        if args.flux_guidance != 3.5 {
+            w.push(
+                "--flux-guidance is FLUX-only and ignored by SDXL (SDXL uses --guidance-scale)"
+                    .into(),
+            );
+        }
+        if args.quantization != Quantization::Q8 {
+            w.push("--quantization applies to FLUX GGUF models only and is ignored by SDXL".into());
+        }
+        if !args.uncond_prompt.is_empty() && args.guidance_scale <= 1.0 {
+            w.push("--uncond-prompt has no effect with --guidance-scale <= 1.0 (classifier-free guidance disabled)".into());
+        }
+    }
+    w
+}
+
 pub fn parse_seed_range(s: &str) -> Result<Vec<u64>> {
     let parts: Vec<&str> = s.split('-').collect();
     if parts.len() != 2 {
@@ -200,5 +258,99 @@ pub fn output_for_seed(base: &Option<String>, seed: u64) -> String {
             let n: u32 = rand::random();
             format!("out/out-{seed}-{n}.png")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn args_from(extra: &[&str]) -> Args {
+        let mut argv = vec!["etch"];
+        argv.extend_from_slice(extra);
+        Args::parse_from(argv)
+    }
+
+    fn warnings(extra: &[&str]) -> Vec<String> {
+        ignored_flag_warnings(&args_from(extra))
+    }
+
+    #[test]
+    fn flux_defaults_produce_no_warnings() {
+        assert!(warnings(&["--model", "schnell"]).is_empty());
+        assert!(warnings(&["--model", "dev", "--flux-guidance", "2.0"]).is_empty());
+    }
+
+    #[test]
+    fn sdxl_defaults_produce_no_warnings() {
+        assert!(warnings(&["--model", "araminta"]).is_empty());
+        assert!(
+            warnings(&[
+                "--model",
+                "araminta",
+                "--uncond-prompt",
+                "blurry",
+                "--guidance-scale",
+                "7.5"
+            ])
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn sdxl_only_flags_warn_on_flux() {
+        let w = warnings(&[
+            "--model",
+            "schnell",
+            "--lora",
+            "style.safetensors",
+            "--scheduler",
+            "dpm2m-karras",
+            "--clip-skip",
+            "2",
+        ]);
+        assert_eq!(w.len(), 3, "{w:?}");
+        assert!(w[0].contains("--lora"));
+        assert!(w[1].contains("--scheduler"));
+        assert!(w[2].contains("--clip-skip"));
+    }
+
+    #[test]
+    fn flux_only_flags_warn_on_sdxl() {
+        let w = warnings(&[
+            "--model",
+            "araminta",
+            "--gguf",
+            "flux.gguf",
+            "--sequential-te",
+            "--flux-guidance",
+            "2.0",
+        ]);
+        assert_eq!(w.len(), 3, "{w:?}");
+        assert!(w.iter().any(|m| m.contains("--gguf")));
+        assert!(w.iter().any(|m| m.contains("--sequential-te")));
+        assert!(w.iter().any(|m| m.contains("--flux-guidance")));
+    }
+
+    #[test]
+    fn schnell_warns_on_flux_guidance() {
+        let w = warnings(&["--model", "schnell", "--flux-guidance", "2.0"]);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("distilled"));
+    }
+
+    #[test]
+    fn uncond_prompt_without_cfg_warns() {
+        let w = warnings(&[
+            "--model",
+            "araminta",
+            "--uncond-prompt",
+            "blurry",
+            "--guidance-scale",
+            "1.0",
+        ]);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("classifier-free guidance disabled"));
     }
 }

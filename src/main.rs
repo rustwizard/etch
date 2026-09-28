@@ -40,6 +40,10 @@ fn main() -> Result<()> {
         builder.without_time().with_target(false).init();
     }
 
+    for warning in cli::ignored_flag_warnings(&args) {
+        tracing::warn!("{warning}");
+    }
+
     let device = device::pick_device(args.cpu);
     info!("Device: {:?}", device);
 
