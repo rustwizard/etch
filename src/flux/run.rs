@@ -45,6 +45,14 @@ impl crate::pipeline::Pipeline for FluxPipeline {
             .ok_or_else(|| anyhow::anyhow!("FLUX pipeline not prepared"))?;
         generate_flux(p, args)
     }
+
+    fn noise_device(&self) -> &Device {
+        &self
+            .prepared
+            .as_ref()
+            .expect("FLUX pipeline prepared before noise_device")
+            .flux_device
+    }
 }
 
 fn prepare_flux(args: &Args, device: &Device, dtype: DType) -> Result<FluxPrepared> {
