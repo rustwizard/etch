@@ -169,7 +169,7 @@
 
 ## Уже реализовано
 
-- [x] **Seed для GGUF и ограничения CPU** — ветка `fix/gguf-seed-device`.
+- [x] **Seed для GGUF и ограничения CPU** — PR #35.
   У `Pipeline` появился `noise_device()`: `main.rs` сидит устройство, которое
   фактически создаёт шум (для FLUX GGUF — CPU, а не GPU). Проверено, что в
   candle 0.11 `Device::set_seed` для CPU завершается ошибкой (`cannot seed the
