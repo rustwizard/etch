@@ -175,7 +175,7 @@
 
 ## Уже реализовано
 
-- [x] **Нормализация tiled VAE decode** — ветка `fix/tiled-vae-weight-normalization`.
+- [x] **Нормализация tiled VAE decode** — PR #34.
   `tiled_decode` накапливает `weight_sum` и делит итог на него; рампы feather-масок
   переведены на `(x+1)/(overlap+1)`, чтобы соседние тайлы никогда не давали нулевую
   сумму весов на шве. Тест с константным latent и identity decoder фиксирует
