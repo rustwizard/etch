@@ -86,15 +86,20 @@ cargo clippy --features metal   # or --features cuda
 
 ## Testing
 
-**No test suite currently exists.** `cargo test` runs zero tests.
+Unit tests currently cover CLI validation/warnings, Karras schedulers, and PNG/JPEG
+saving. Run them with `cargo test`; at the time of the `IMPROVEMENTS.md` refresh,
+18 tests pass.
 
-Planned tests are documented in `IMPROVEMENTS.md`:
+Further tests are documented in `IMPROVEMENTS.md`, including:
 
-- Unit tests for `te_lora_base_to_weight_key`, `ldm_lora_base_to_unet_key`, `greedy_tokenize` in `src/lora.rs`
-- Unit tests for `build_karras_schedule` monotonicity/boundaries in `src/schedulers.rs`
-- Integration smoke test: run with `--cpu --n-steps 1` to verify pipeline startup
+- Unit tests for LoRA key conversion and merging in `src/lora.rs`
+- Regression tests for tiled VAE normalization and embedding cache keys/writes
+- Integration smoke test: run with `--cpu --n-steps 1` to verify pipeline startup;
+  because model downloads/loading remain expensive, run this manually or in scheduled
+  CI rather than on every PR
 
-When adding tests, use `cargo test` for unit tests and consider the smoke test target above.
+When adding tests, use `cargo test` for unit tests and keep model-independent CLI
+integration tests separate from the full model smoke test.
 
 ## CI / deployment
 
