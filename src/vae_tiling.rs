@@ -38,6 +38,10 @@ pub fn tiled_decode(
     let overlap_out_w = overlap * scale_w;
 
     let mut output = Tensor::zeros((1, 3, output_h, output_w), DType::F32, device)?;
+    // Sum of feather weights per pixel. Overlaps blend with complementary
+    // ramps, so without normalization the result darkens wherever the mask
+    // sum is below 1.
+    let mut weight_sum = Tensor::zeros((1, 1, output_h, output_w), DType::F32, device)?;
 
     // Feather masks repeat across the grid: every interior tile shares one
     // mask, and edge/corner tiles repeat along rows and columns. Cache them
@@ -104,13 +108,22 @@ pub fn tiled_decode(
                 &[0..1, 0..3, out_y0..out_y0 + out_h, out_x0..out_x0 + out_w],
                 &updated,
             )?;
+            let wregion = weight_sum
+                .narrow(2, out_y0, out_h)?
+                .narrow(3, out_x0, out_w)?;
+            weight_sum = weight_sum.slice_assign(
+                &[0..1, 0..1, out_y0..out_y0 + out_h, out_x0..out_x0 + out_w],
+                &(wregion + weight)?,
+            )?;
 
             x0 += stride;
         }
         y0 += stride;
     }
 
-    Ok(output)
+    // Every output pixel is covered by at least one tile whose feather ramp
+    // is strictly positive (see `tile_weight`), so the divisor never vanishes.
+    Ok(output.broadcast_div(&weight_sum)?)
 }
 
 struct TileParams {
@@ -132,10 +145,16 @@ fn tile_weight(params: &TileParams, device: &Device) -> Result<Tensor> {
     let eff_overlap_h = params.overlap_h.min(h / 2);
     let eff_overlap_w = params.overlap_w.min(w / 2);
 
+    // Ramps use (x+1)/(overlap+1) instead of x/overlap: the endpoints stay
+    // strictly positive, so neighbouring tiles never both contribute zero
+    // weight to the same pixel. For full-size tiles the ramps are exact
+    // complements (summing to 1); truncated edge tiles still leave every
+    // pixel covered with positive total weight, and `tiled_decode` divides
+    // by the accumulated sum to remove any residual darkening.
     if params.feather_left {
         for y in 0..h {
             for x in 0..eff_overlap_w {
-                let t = x as f32 / eff_overlap_w as f32;
+                let t = (x + 1) as f32 / (eff_overlap_w + 1) as f32;
                 weights[y * w + x] *= t;
             }
         }
@@ -144,7 +163,7 @@ fn tile_weight(params: &TileParams, device: &Device) -> Result<Tensor> {
         for y in 0..h {
             for xi in 0..eff_overlap_w {
                 let x = w - 1 - xi;
-                let t = xi as f32 / eff_overlap_w as f32;
+                let t = (xi + 1) as f32 / (eff_overlap_w + 1) as f32;
                 weights[y * w + x] *= t;
             }
         }
@@ -152,7 +171,7 @@ fn tile_weight(params: &TileParams, device: &Device) -> Result<Tensor> {
     if params.feather_top {
         for y in 0..eff_overlap_h {
             for x in 0..w {
-                let t = y as f32 / eff_overlap_h as f32;
+                let t = (y + 1) as f32 / (eff_overlap_h + 1) as f32;
                 weights[y * w + x] *= t;
             }
         }
@@ -161,7 +180,7 @@ fn tile_weight(params: &TileParams, device: &Device) -> Result<Tensor> {
         for yi in 0..eff_overlap_h {
             let y = h - 1 - yi;
             for x in 0..w {
-                let t = yi as f32 / eff_overlap_h as f32;
+                let t = (yi + 1) as f32 / (eff_overlap_h + 1) as f32;
                 weights[y * w + x] *= t;
             }
         }
@@ -169,4 +188,43 @@ fn tile_weight(params: &TileParams, device: &Device) -> Result<Tensor> {
 
     let mask = Tensor::from_slice(&weights, (h, w), device)?;
     Ok(mask.unsqueeze(0)?.unsqueeze(0)?.to_dtype(DType::F32)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With an identity "decoder", a constant latent must decode to the same
+    /// constant in every pixel — including tile seams, edges and corners.
+    /// Before weight normalization the feather ramps darkened overlaps
+    /// (and produced zero-weight seam columns), so this test failed.
+    #[test]
+    fn constant_latent_stays_constant() -> Result<()> {
+        let device = Device::Cpu;
+        let cases: &[(usize, usize, usize, usize)] = &[
+            // (latent_h, latent_w, tile_size, overlap)
+            (8, 8, 4, 2),
+            (12, 10, 5, 2),
+            (6, 6, 6, 1),
+            (16, 16, 6, 4),
+            (7, 13, 4, 1),
+        ];
+        for &(h, w, tile, overlap) in cases {
+            let value = 0.7f32;
+            let latent = Tensor::full(value, (1, 3, h, w), &device)?;
+            let out = tiled_decode(&latent, tile, overlap, h, w, |t| Ok(t.clone()))?;
+            anyhow::ensure!(
+                out.dims4()? == (1, 3, h, w),
+                "unexpected output dims for case {h}x{w} tile={tile} overlap={overlap}"
+            );
+            let data = out.flatten_all()?.to_vec1::<f32>()?;
+            for (i, &v) in data.iter().enumerate() {
+                assert!(
+                    (v - value).abs() < 1e-4,
+                    "case {h}x{w} tile={tile} overlap={overlap}: pixel {i} = {v}, want {value}"
+                );
+            }
+        }
+        Ok(())
+    }
 }
