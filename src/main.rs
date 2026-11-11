@@ -70,13 +70,25 @@ fn main() -> Result<()> {
     let mut pipeline = pipeline::for_model(args.model);
     pipeline.prepare(&args, &device, dtype)?;
 
+    // Seed the device that actually creates the random tensors. For FLUX GGUF
+    // that is the CPU (the DiT runs there), not the GPU picked above — seeding
+    // the GPU would silently have no effect. Candle cannot seed the CPU RNG
+    // at all, so CPU runs are inherently non-reproducible.
+    let noise_device = pipeline.noise_device();
+    let cpu_rng = matches!(noise_device, Device::Cpu);
+    if cpu_rng {
+        tracing::warn!(
+            "The CPU random number generator cannot be seeded — results are not reproducible on CPU; use a GPU backend with non-GGUF weights for reproducible --seed runs"
+        );
+    }
+
     for seed in seeds {
         if signals::interrupted() {
             info!("Interrupted — stopping before seed {seed}");
             std::process::exit(130);
         }
         info!("--- Seed: {seed} ({seed_source}) ---");
-        if let Err(e) = device.set_seed(seed) {
+        if !cpu_rng && let Err(e) = noise_device.set_seed(seed) {
             tracing::warn!("Failed to set seed {seed}: {e}");
         }
 

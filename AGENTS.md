@@ -267,7 +267,7 @@ Defined in `src/cli.rs` (clap derive). Key flags:
 
 ## Key gotchas
 
-- **Seed not reproducible on CPU** — `Device::set_seed` only works for GPU. CPU PRNG ignores it.
+- **Seed not reproducible on CPU** — candle's CPU RNG cannot be seeded (`Device::set_seed` returns an error). `main.rs` seeds the pipeline's `noise_device()` (for FLUX GGUF that is the CPU, not the GPU) and prints a one-time warning when the noise device is CPU.
 - **`metal + cuda` is a compile error** — a `compile_error!` guard in `src/device.rs` rejects builds with both GPU features enabled; pick exactly one backend.
 - **GGUF models force dtype=F32 and DiT on CPU** — quantized weights dequantize to F32; mixing BF16 tensors with F32 weights fails in matmul. The DiT also runs on CPU to avoid device mismatches and Metal OOM.
 - **`--guidance-scale` is SDXL-only** (typical range ~5–10). FLUX dev uses `--flux-guidance` (default 3.5); `schnell` ignores guidance because it is distilled. These are separate flags with different semantics.

@@ -236,11 +236,13 @@ GGUF runs the DiT on CPU. Add `--vae-tile-size 64` (`128` for ≥768 px) to avoi
 
 This is a characteristic of the Araminta model, not a bug. A few ways to get more variety:
 
-**Set an explicit seed** — without `--seed` a random seed is picked each run (results vary, but are not reproducible). An explicit seed makes a run repeatable:
+**Set an explicit seed** — without `--seed` a random seed is picked each run (results vary, but are not reproducible). An explicit seed makes a run repeatable **on GPU**:
 ```bash
 --seed 1234
 --seed 9999
 ```
+
+> **Reproducibility note:** seeds only work on GPU (Metal/CUDA). Candle cannot seed the CPU random number generator, so any run that creates noise on CPU is not reproducible — this includes `--cpu` runs and all GGUF models (the FLUX GGUF DiT always runs on CPU). `etch` prints a warning in that case. Also note that reproducing the same image requires the same model, resolution, steps, guidance, and dtype.
 
 **Use `--seed-range`** to quickly scan many seeds and pick the best composition:
 ```bash

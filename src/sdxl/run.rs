@@ -54,6 +54,14 @@ impl crate::pipeline::Pipeline for SdxlPipeline {
             .ok_or_else(|| anyhow::anyhow!("SDXL pipeline not prepared"))?;
         generate_sdxl(p, args)
     }
+
+    fn noise_device(&self) -> &Device {
+        &self
+            .prepared
+            .as_ref()
+            .expect("SDXL pipeline prepared before noise_device")
+            .device
+    }
 }
 
 fn prepare_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<SdxlPrepared> {

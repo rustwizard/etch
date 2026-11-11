@@ -11,6 +11,10 @@ use candle_core::{DType, Device};
 pub trait Pipeline {
     fn prepare(&mut self, args: &Args, device: &Device, dtype: DType) -> Result<()>;
     fn generate(&self, args: &Args) -> Result<()>;
+    /// Device on which random tensors (initial noise/latents) are created.
+    /// Seeding any other device has no effect on generation. Only valid
+    /// after `prepare`.
+    fn noise_device(&self) -> &Device;
 }
 
 pub fn for_model(model: Model) -> Box<dyn Pipeline> {
