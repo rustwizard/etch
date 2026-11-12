@@ -67,14 +67,15 @@ impl crate::pipeline::Pipeline for SdxlPipeline {
 fn prepare_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<SdxlPrepared> {
     let height = args.height.unwrap_or(768);
     let width = args.width.unwrap_or(1024);
-    anyhow::ensure!(
-        height.is_multiple_of(8),
-        "--height must be a multiple of 8, got {height}"
-    );
-    anyhow::ensure!(
-        width.is_multiple_of(8),
-        "--width must be a multiple of 8, got {width}"
-    );
+    crate::cli::validate_dimensions(height, width, 8)?;
+    // The VAE latent is pixels/8; tiling misconfiguration must fail here,
+    // not after the whole denoising run.
+    crate::cli::validate_vae_tiling(
+        args.vae_tile_size,
+        args.vae_tile_overlap,
+        height / 8,
+        width / 8,
+    )?;
     let n_steps = args.n_steps.unwrap_or(20);
     let guidance_scale = args.guidance_scale;
     anyhow::ensure!(

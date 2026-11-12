@@ -58,14 +58,15 @@ impl crate::pipeline::Pipeline for FluxPipeline {
 fn prepare_flux(args: &Args, device: &Device, dtype: DType) -> Result<FluxPrepared> {
     let height = args.height.unwrap_or(768);
     let width = args.width.unwrap_or(1360);
-    anyhow::ensure!(
-        height.is_multiple_of(16),
-        "--height must be a multiple of 16, got {height}"
-    );
-    anyhow::ensure!(
-        width.is_multiple_of(16),
-        "--width must be a multiple of 16, got {width}"
-    );
+    crate::cli::validate_dimensions(height, width, 16)?;
+    // The VAE latent is pixels/8; tiling misconfiguration must fail here,
+    // not after the whole denoising run.
+    crate::cli::validate_vae_tiling(
+        args.vae_tile_size,
+        args.vae_tile_overlap,
+        height / 8,
+        width / 8,
+    )?;
     let api = hf_hub::api::sync::Api::new()?;
 
     // GGUF weights live in CPU RAM; run the entire DiT on CPU to avoid device
