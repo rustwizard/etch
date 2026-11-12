@@ -156,7 +156,7 @@
 
 ## Уже реализовано
 
-- [x] **Дешёвые проверки параметров до загрузки весов** — ветка `fix/early-param-validation`.
+- [x] **Дешёвые проверки параметров до загрузки весов** — PR #37.
   `cli::validate_args` (расширение `--output` только png/jpeg; для dev-моделей
   `flux_guidance` конечный и в 0.0–100.0) запускается рядом с `validate_n_steps`.
   `cli::validate_dimensions` (ненулевые кратные размеры) и `cli::validate_vae_tiling`
