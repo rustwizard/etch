@@ -160,6 +160,29 @@ fn prepare_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<SdxlPrepar
         } else {
             None
         };
+        // Embeddings depend on the tokenizer and text encoder files inside a
+        // local model directory, not on the directory path: hash exactly the
+        // files that feed the embeddings so replacing any of them (at the
+        // same path) invalidates the cache. UNet/VAE weights do not affect
+        // embeddings and are deliberately excluded.
+        let local_key = if let Some(dir) = &args.local_model {
+            const EMBEDDING_FILES: [&str; 4] = [
+                "tokenizer/tokenizer.json",
+                "tokenizer_2/tokenizer.json",
+                "text_encoder/model.safetensors",
+                "text_encoder_2/model.safetensors",
+            ];
+            let mut digests = Vec::with_capacity(EMBEDDING_FILES.len());
+            for rel in EMBEDDING_FILES {
+                let path = std::path::Path::new(dir).join(rel);
+                let digest = crate::cache::file_digest(&path)
+                    .map_err(|e| E::msg(format!("failed to hash {rel} in --local-model: {e}")))?;
+                digests.push(digest);
+            }
+            Some(digests.join("-"))
+        } else {
+            None
+        };
         let clip_skip_key = if args.clip_skip > 1 {
             Some(format!("cs{}", args.clip_skip))
         } else {
@@ -178,12 +201,8 @@ fn prepare_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<SdxlPrepar
                 cfg_key,
                 &dtype_key,
             ];
-            // A local diffusers directory changes which weights produce the
-            // embeddings; different paths (even pointing at the same weights)
-            // safely get separate cache entries.
-            if let Some(ref lm) = args.local_model {
-                v.push("local");
-                v.push(lm);
+            if let Some(ref lk) = local_key {
+                v.push(lk);
             }
             if let Some(ref lk) = lora_key {
                 v.push(lk);

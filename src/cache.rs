@@ -136,27 +136,32 @@ mod tests {
 
     #[test]
     fn changed_lora_content_changes_key() {
-        // Regression: the SDXL cache key must depend on LoRA file contents,
-        // so replacing the file at the same path invalidates the cache.
-        let dir = std::env::temp_dir();
-        let path_a = dir.join("etch-test-lora-a.safetensors");
-        let path_b = dir.join("etch-test-lora-b.safetensors");
-        std::fs::write(&path_a, b"lora-weights-v1").expect("write test file a");
-        std::fs::write(&path_b, b"lora-weights-v2").expect("write test file b");
+        // Regression: the SDXL cache key must depend on file contents, so
+        // replacing a LoRA file at the same path invalidates the cache. The
+        // test rewrites one file in place — exactly that scenario. The temp
+        // dir is unique per process so parallel test binaries cannot race.
+        let dir = std::env::temp_dir().join(format!(
+            "etch-cache-test-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).expect("create unique temp dir");
+        let lora_path = dir.join("adapter.safetensors");
 
-        let digest_a = file_digest(&path_a).expect("digest a");
-        let digest_b = file_digest(&path_b).expect("digest b");
-        assert_ne!(digest_a, digest_b);
+        std::fs::write(&lora_path, b"lora-weights-v1").expect("write v1");
+        let digest_v1 = file_digest(&lora_path).expect("digest v1");
+        std::fs::write(&lora_path, b"lora-weights-v2").expect("write v2");
+        let digest_v2 = file_digest(&lora_path).expect("digest v2");
+        assert_ne!(digest_v1, digest_v2);
 
-        let key_a = CacheKey::from_parts(&["sdxl", "a cat", &digest_a, "1.0"]);
-        let key_b = CacheKey::from_parts(&["sdxl", "a cat", &digest_b, "1.0"]);
-        assert_ne!(key_a.hash, key_b.hash);
+        let key_v1 = CacheKey::from_parts(&["sdxl", "a cat", &digest_v1, "1.0"]);
+        let key_v2 = CacheKey::from_parts(&["sdxl", "a cat", &digest_v2, "1.0"]);
+        assert_ne!(key_v1.hash, key_v2.hash);
 
-        // Same content hashed again must give the same key inputs.
-        let digest_a2 = file_digest(&path_a).expect("digest a again");
-        assert_eq!(digest_a, digest_a2);
+        // Same content hashed again must give the same digest.
+        let digest_v2_again = file_digest(&lora_path).expect("digest v2 again");
+        assert_eq!(digest_v2, digest_v2_again);
 
-        std::fs::remove_file(&path_a).expect("remove test file a");
-        std::fs::remove_file(&path_b).expect("remove test file b");
+        std::fs::remove_dir_all(&dir).expect("remove unique temp dir");
     }
 }
