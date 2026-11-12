@@ -151,10 +151,15 @@ fn prepare_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<SdxlPrepar
     // Build embeddings from both encoders and cat along hidden dim
     let text_embeddings = {
         let cache = EmbeddingCache::new(EmbeddingCache::default_dir());
-        let lora_key = args
-            .lora
-            .as_ref()
-            .map(|p| format!("{p}-{}", args.lora_scale));
+        // Embeddings depend on the LoRA file contents, not just its path: a
+        // file replaced at the same path must not reuse stale embeddings.
+        let lora_key = if let Some(p) = &args.lora {
+            let digest = crate::cache::file_digest(std::path::Path::new(p))
+                .map_err(|e| E::msg(format!("failed to hash LoRA file {p}: {e}")))?;
+            Some(format!("{digest}-{}", args.lora_scale))
+        } else {
+            None
+        };
         let clip_skip_key = if args.clip_skip > 1 {
             Some(format!("cs{}", args.clip_skip))
         } else {
@@ -173,6 +178,13 @@ fn prepare_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<SdxlPrepar
                 cfg_key,
                 &dtype_key,
             ];
+            // A local diffusers directory changes which weights produce the
+            // embeddings; different paths (even pointing at the same weights)
+            // safely get separate cache entries.
+            if let Some(ref lm) = args.local_model {
+                v.push("local");
+                v.push(lm);
+            }
             if let Some(ref lk) = lora_key {
                 v.push(lk);
             }
