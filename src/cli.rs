@@ -268,6 +268,74 @@ pub fn validate_n_steps(n_steps: Option<usize>) -> Result<()> {
     Ok(())
 }
 
+/// Cheap, model-independent argument checks, run before any weights load.
+/// Model-specific checks (dimensions, tiling against the latent size) live in
+/// each pipeline's `prepare`.
+pub fn validate_args(args: &Args) -> Result<()> {
+    if let Some(ref out) = args.output
+        && let Some(ext) = std::path::Path::new(out)
+            .extension()
+            .and_then(|e| e.to_str())
+    {
+        // image::save_image only handles PNG and JPEG; anything else would
+        // fail after a full generation run.
+        let ext = ext.to_ascii_lowercase();
+        anyhow::ensure!(
+            matches!(ext.as_str(), "png" | "jpg" | "jpeg"),
+            "--output extension must be png or jpeg, got '{ext}'"
+        );
+    }
+    // Only dev models consume --flux-guidance; other models ignore it.
+    if matches!(args.model, Model::Dev | Model::DevGguf) {
+        let g = args.flux_guidance;
+        anyhow::ensure!(
+            g.is_finite() && (0.0..=100.0).contains(&g),
+            "--flux-guidance must be a finite number in 0.0–100.0 (typical range 1.0–5.0), got {g}"
+        );
+    }
+    Ok(())
+}
+
+/// Validate image dimensions against the model's pixel granularity. Zero
+/// passes `is_multiple_of` but would produce empty latents deep in the run.
+pub fn validate_dimensions(height: usize, width: usize, multiple: usize) -> Result<()> {
+    anyhow::ensure!(height > 0, "--height must be greater than 0, got {height}");
+    anyhow::ensure!(width > 0, "--width must be greater than 0, got {width}");
+    anyhow::ensure!(
+        height.is_multiple_of(multiple),
+        "--height must be a multiple of {multiple}, got {height}"
+    );
+    anyhow::ensure!(
+        width.is_multiple_of(multiple),
+        "--width must be a multiple of {multiple}, got {width}"
+    );
+    Ok(())
+}
+
+/// Validate VAE tiling against the latent dimensions, before any weights are
+/// loaded. `tiled_decode` re-checks these invariants, but failing here avoids
+/// wasting a full denoising run on a misconfiguration. `tile_size == 0`
+/// disables tiling and skips all checks.
+pub fn validate_vae_tiling(
+    tile_size: usize,
+    overlap: usize,
+    latent_h: usize,
+    latent_w: usize,
+) -> Result<()> {
+    if tile_size == 0 {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        tile_size > overlap,
+        "--vae-tile-size ({tile_size}) must be greater than --vae-tile-overlap ({overlap})"
+    );
+    anyhow::ensure!(
+        tile_size <= latent_h && tile_size <= latent_w,
+        "--vae-tile-size ({tile_size}) must fit within the latent ({latent_h}x{latent_w})"
+    );
+    Ok(())
+}
+
 pub fn output_for_seed(base: &Option<String>, seed: u64) -> String {
     match base {
         Some(path) => {
@@ -424,5 +492,66 @@ mod tests {
         ]);
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("classifier-free guidance disabled"));
+    }
+
+    #[test]
+    fn output_extension_validation() {
+        assert!(validate_args(&args_from(&["--output", "out/a.png"])).is_ok());
+        assert!(validate_args(&args_from(&["--output", "out/a.JPG"])).is_ok());
+        // No extension: output_for_seed defaults to .png.
+        assert!(validate_args(&args_from(&["--output", "out/a"])).is_ok());
+        let err = validate_args(&args_from(&["--output", "out/a.webp"]))
+            .expect_err("webp must be rejected");
+        assert!(err.to_string().contains("png or jpeg"), "{err}");
+        let err = validate_args(&args_from(&["--output", "out/a."]))
+            .expect_err("empty extension must be rejected");
+        assert!(err.to_string().contains("png or jpeg"), "{err}");
+    }
+
+    #[test]
+    fn flux_guidance_validation() {
+        // In-range and boundary values pass.
+        for g in ["0.0", "3.5", "100.0"] {
+            let a = args_from(&["--model", "dev", "--flux-guidance", g]);
+            assert!(validate_args(&a).is_ok(), "guidance {g} must be accepted");
+        }
+        // Note: clap itself rejects hyphen-leading values like "-1.0"
+        // before validation runs; "1e400" parses to +inf and exercises the
+        // finiteness check.
+        for g in ["NaN", "inf", "1e400", "100.1"] {
+            let a = args_from(&["--model", "dev", "--flux-guidance", g]);
+            assert!(
+                validate_args(&a).is_err(),
+                "guidance {g} must be rejected for dev"
+            );
+        }
+        // Models that ignore --flux-guidance are not constrained by it.
+        let a = args_from(&["--model", "schnell", "--flux-guidance", "NaN"]);
+        assert!(validate_args(&a).is_ok());
+    }
+
+    #[test]
+    fn dimension_validation() {
+        assert!(validate_dimensions(768, 1360, 16).is_ok());
+        assert!(validate_dimensions(768, 1024, 8).is_ok());
+        let zero = validate_dimensions(0, 1360, 16).expect_err("zero height must fail");
+        assert!(zero.to_string().contains("--height"), "{zero}");
+        let bad = validate_dimensions(770, 1024, 8).expect_err("non-multiple must fail");
+        assert!(bad.to_string().contains("multiple of 8"), "{bad}");
+    }
+
+    #[test]
+    fn vae_tiling_validation() {
+        // Disabled tiling skips all checks.
+        assert!(validate_vae_tiling(0, 8, 96, 96).is_ok());
+        assert!(validate_vae_tiling(0, 999, 96, 96).is_ok());
+        assert!(validate_vae_tiling(64, 8, 96, 96).is_ok());
+        let overlap = validate_vae_tiling(8, 8, 96, 96).expect_err("overlap >= tile must fail");
+        assert!(overlap.to_string().contains("greater than"), "{overlap}");
+        let fit = validate_vae_tiling(128, 8, 96, 96).expect_err("oversized tile must fail");
+        assert!(fit.to_string().contains("fit within"), "{fit}");
+        // Tiling is checked against the latent (pixels/8), not the image size.
+        assert!(validate_vae_tiling(128, 8, 96, 96).is_err());
+        assert!(validate_vae_tiling(128, 8, 128, 128).is_ok());
     }
 }
