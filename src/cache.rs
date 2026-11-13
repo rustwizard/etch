@@ -88,12 +88,34 @@ impl EmbeddingCache {
     pub fn set(&self, key: &CacheKey, tensors: &HashMap<String, Tensor>) -> Result<()> {
         std::fs::create_dir_all(&self.root)?;
         let path = self.path_for(key);
-        let cpu_tensors: HashMap<String, Tensor> = tensors
-            .iter()
-            .map(|(k, v)| Ok((k.clone(), v.to_device(&Device::Cpu)?)))
-            .collect::<Result<_>>()?;
-        candle_core::safetensors::save(&cpu_tensors, &path)?;
-        Ok(())
+        // Write to a unique temp file in the same directory, then atomically
+        // rename over the destination. A crash mid-write then leaves the
+        // previous entry (or none) intact instead of a truncated safetensors
+        // file that every later run would fail to read. The temp name is
+        // unique per process and attempt so parallel runs never clash.
+        let tmp = self.root.join(format!(
+            ".{}.tmp-{}-{}",
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("cache-entry"),
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let result = (|| {
+            let cpu_tensors: HashMap<String, Tensor> = tensors
+                .iter()
+                .map(|(k, v)| Ok((k.clone(), v.to_device(&Device::Cpu)?)))
+                .collect::<Result<_>>()?;
+            candle_core::safetensors::save(&cpu_tensors, &tmp)?;
+            std::fs::rename(&tmp, &path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            // Best-effort cleanup; a leftover temp file only wastes space
+            // and is never read as a cache entry.
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
     }
 }
 
@@ -163,5 +185,67 @@ mod tests {
         assert_eq!(digest_v2, digest_v2_again);
 
         std::fs::remove_dir_all(&dir).expect("remove unique temp dir");
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "etch-{name}-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ))
+    }
+
+    #[test]
+    fn set_get_roundtrip() {
+        let dir = unique_test_dir("cache-roundtrip");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cache = EmbeddingCache::new(dir.clone());
+        let key = CacheKey::from_parts(&["flux", "a cat", "F32"]);
+
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "emb".to_string(),
+            Tensor::full(0.5f32, (1, 4), &Device::Cpu).expect("test tensor"),
+        );
+        cache.set(&key, &tensors).expect("set");
+
+        let got = cache
+            .get(&key, &["emb"], &Device::Cpu)
+            .expect("get")
+            .expect("cache hit");
+        let emb = got.get("emb").expect("emb present");
+        assert_eq!(emb.dims(), &[1, 4]);
+        assert_eq!(emb.to_vec2::<f32>().expect("vec"), vec![vec![0.5; 4]]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn set_replaces_corrupt_entry() {
+        // Recovery: a truncated/partially written cache file (e.g. left by an
+        // interrupted non-atomic write, or external corruption) must be
+        // atomically replaced by set(), not block every later run.
+        let dir = unique_test_dir("cache-corrupt");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cache = EmbeddingCache::new(dir.clone());
+        let key = CacheKey::from_parts(&["sdxl", "a cat", "cfg2", "BF16"]);
+
+        let corrupt = cache.path_for(&key);
+        std::fs::write(&corrupt, b"garbage-not-safetensors").expect("write corrupt file");
+
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "emb".to_string(),
+            Tensor::full(1.0f32, (2, 2), &Device::Cpu).expect("test tensor"),
+        );
+        cache.set(&key, &tensors).expect("set over corrupt entry");
+
+        let got = cache
+            .get(&key, &["emb"], &Device::Cpu)
+            .expect("get after recovery")
+            .expect("cache hit after recovery");
+        assert_eq!(got.get("emb").expect("emb present").dims(), &[2, 2]);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
