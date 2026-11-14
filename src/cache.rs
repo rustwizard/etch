@@ -77,8 +77,14 @@ impl EmbeddingCache {
         device: &Device,
     ) -> Result<Option<HashMap<String, Tensor>>> {
         let path = self.path_for(key);
-        if !path.exists() {
-            return Ok(None);
+        // try_exists, not exists(): Path::exists() collapses metadata errors
+        // (permission denied, filesystem errors, symlink loops) into false,
+        // which would masquerade an inaccessible entry as a silent miss and
+        // trigger an expensive recompute.
+        match path.try_exists() {
+            Ok(false) => return Ok(None),
+            Ok(true) => {}
+            Err(e) => anyhow::bail!("cannot access cache entry {}: {e}", path.display()),
         }
         let tensors = candle_core::safetensors::load(&path, device)
             .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
@@ -293,6 +299,30 @@ mod tests {
             .expect_err("missing tensor must error");
         let msg = format!("{err:#}");
         assert!(msg.contains("missing tensor 'emb'"), "{msg}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A metadata error on the entry path (here: a symlink loop) must surface
+    /// as an access error, not be swallowed into a silent cache miss the way
+    /// `Path::exists()` would do it.
+    #[cfg(unix)]
+    #[test]
+    fn get_reports_access_errors_instead_of_miss() {
+        let dir = unique_test_dir("cache-access");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cache = EmbeddingCache::new(dir.clone());
+        let key = CacheKey::from_parts(&["flux", "a cat", "F32"]);
+
+        let entry = cache.path_for(&key);
+        // Symlink pointing at itself: metadata fails with ELOOP.
+        std::os::unix::fs::symlink(&entry, &entry).expect("create symlink loop");
+
+        let err = cache
+            .get(&key, &["emb"], &Device::Cpu)
+            .expect_err("access error must not be a silent miss");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cannot access cache entry"), "{msg}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
