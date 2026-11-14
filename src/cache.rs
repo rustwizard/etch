@@ -66,6 +66,10 @@ impl EmbeddingCache {
             .join(format!("{}-{}.safetensors", key.prefix, key.hash))
     }
 
+    /// Look up a cache entry. `Ok(None)` is a silent miss (no entry exists).
+    /// `Err` means an entry exists but is unreadable or incomplete — callers
+    /// should warn with the reason and recompute, which also overwrites the
+    /// bad entry via `set`.
     pub fn get(
         &self,
         key: &CacheKey,
@@ -76,10 +80,11 @@ impl EmbeddingCache {
         if !path.exists() {
             return Ok(None);
         }
-        let tensors = candle_core::safetensors::load(&path, device)?;
+        let tensors = candle_core::safetensors::load(&path, device)
+            .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
         for name in names {
             if !tensors.contains_key(*name) {
-                return Ok(None);
+                anyhow::bail!("cache entry {} is missing tensor '{name}'", path.display());
             }
         }
         Ok(Some(tensors))
@@ -245,6 +250,49 @@ mod tests {
             .expect("get after recovery")
             .expect("cache hit after recovery");
         assert_eq!(got.get("emb").expect("emb present").dims(), &[2, 2]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn get_distinguishes_miss_from_corrupt_entry() {
+        let dir = unique_test_dir("cache-get-errors");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cache = EmbeddingCache::new(dir.clone());
+        let key = CacheKey::from_parts(&["flux", "a cat", "F32"]);
+        let device = Device::Cpu;
+
+        // No entry yet: silent miss, not an error.
+        assert!(
+            cache
+                .get(&key, &["emb"], &device)
+                .expect("miss is fine")
+                .is_none()
+        );
+
+        // Corrupt entry (e.g. interrupted write): an error with the reason,
+        // so the caller can warn and recompute instead of silently loading.
+        std::fs::write(cache.path_for(&key), b"garbage").expect("write corrupt entry");
+        let err = cache
+            .get(&key, &["emb"], &device)
+            .expect_err("corrupt entry must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cannot read"), "{msg}");
+
+        // Well-formed but incomplete entry (missing expected tensor): also
+        // an error, not a silent miss.
+        let other = CacheKey::from_parts(&["flux", "a dog", "F32"]);
+        let mut partial = HashMap::new();
+        partial.insert(
+            "other_tensor".to_string(),
+            Tensor::full(0f32, (1,), &device).expect("test tensor"),
+        );
+        cache.set(&other, &partial).expect("set partial entry");
+        let err = cache
+            .get(&other, &["emb"], &device)
+            .expect_err("missing tensor must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("missing tensor 'emb'"), "{msg}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
