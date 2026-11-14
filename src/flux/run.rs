@@ -98,11 +98,16 @@ fn prepare_flux(args: &Args, device: &Device, dtype: DType) -> Result<FluxPrepar
         &dtype_key,
     ]);
 
-    let (t5_emb, clip_emb) = if let Some(mut cached) = cache
-        .get(&cache_key, &["t5_emb", "clip_emb"], &flux_device)
-        .ok()
-        .flatten()
-    {
+    // A missing entry is a silent miss; an unreadable or incomplete entry
+    // gets a warning with the reason and is recomputed (and overwritten).
+    let cached = match cache.get(&cache_key, &["t5_emb", "clip_emb"], &flux_device) {
+        Ok(cached) => cached,
+        Err(e) => {
+            tracing::warn!("Ignoring unreadable embedding cache, recomputing: {e:#}");
+            None
+        }
+    };
+    let (t5_emb, clip_emb) = if let Some(mut cached) = cached {
         info!("Using cached embeddings for prompt");
         (
             cached.remove("t5_emb").expect("t5_emb in cache"),

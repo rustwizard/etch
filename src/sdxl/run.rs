@@ -215,11 +215,16 @@ fn prepare_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<SdxlPrepar
         };
         let cache_key = CacheKey::from_parts(&parts);
 
-        let (emb1, emb2) = if let Some(mut cached) = cache
-            .get(&cache_key, &["emb1", "emb2"], device)
-            .ok()
-            .flatten()
-        {
+        // A missing entry is a silent miss; an unreadable or incomplete entry
+        // gets a warning with the reason and is recomputed (and overwritten).
+        let cached = match cache.get(&cache_key, &["emb1", "emb2"], device) {
+            Ok(cached) => cached,
+            Err(e) => {
+                tracing::warn!("Ignoring unreadable embedding cache, recomputing: {e:#}");
+                None
+            }
+        };
+        let (emb1, emb2) = if let Some(mut cached) = cached {
             info!("Using cached embeddings for prompt");
             (
                 cached.remove("emb1").expect("emb1 in cache"),
