@@ -140,7 +140,7 @@
 
 ## Уже реализовано
 
-- [x] **Конфигурация SDXL UNet из `unet/config.json`** — ветка `fix/sdxl-unet-config`.
+- [x] **Конфигурация SDXL UNet из `unet/config.json`** — PR #41.
   Новый модуль `src/sdxl/config.rs` парсит diffusers-конфиг (`block_out_channels`,
   `down_block_types`, `attention_head_dim`, `transformer_layers_per_block` — и
   скалярная, и массивная формы — и остальные поля) в `UNet2DConditionModelConfig`.
