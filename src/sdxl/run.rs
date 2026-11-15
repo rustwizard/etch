@@ -18,6 +18,7 @@ use tokenizers::Tokenizer;
 use tracing::info;
 
 use super::clip::{ClipEmbedCtx, sdxl_clip_emb};
+use super::config;
 
 /// Everything loaded once by `prepare` and reused by every `generate` call.
 struct SdxlPrepared {
@@ -276,39 +277,34 @@ fn prepare_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<SdxlPrepar
     info!("Text embeddings: {:?}", text_embeddings.shape());
 
     let unet = {
+        // Architecture comes from the model's own diffusers config, for both
+        // the LoRA and the plain path — a hardcoded SDXL-base layout would
+        // silently mis-build any local model with a different UNet.
+        let unet_cfg = config::load_unet_config(&model_file("unet/config.json")?)?;
         let unet_weights = model_file("unet/diffusion_pytorch_model.safetensors")?;
         crate::hub::log_model_size(&unet_weights, "UNet");
+        let build = |vb: VarBuilder| {
+            unet_2d::UNet2DConditionModel::new(
+                vb,
+                unet_cfg.in_channels,
+                unet_cfg.out_channels,
+                false,
+                unet_cfg.config.clone(),
+            )
+        };
         if let Some(lora) = &lora_map {
             info!("Applying UNet LoRA (scale {})", args.lora_scale);
             let mut tensors = candle_core::safetensors::load(&unet_weights, &Device::Cpu)?;
             tensors = lora::apply_lora(tensors, lora, args.lora_scale)?;
-            let vb = VarBuilder::from_tensors(tensors, dtype, device);
-            let bc = |out_channels, use_cross_attn, attention_head_dim| unet_2d::BlockConfig {
-                out_channels,
-                use_cross_attn,
-                attention_head_dim,
-            };
-            let unet_cfg = unet_2d::UNet2DConditionModelConfig {
-                blocks: vec![
-                    bc(320, None, 5),
-                    bc(640, Some(2), 10),
-                    bc(1280, Some(10), 20),
-                ],
-                center_input_sample: false,
-                cross_attention_dim: 2048,
-                downsample_padding: 1,
-                flip_sin_to_cos: true,
-                freq_shift: 0.,
-                layers_per_block: 2,
-                mid_block_scale_factor: 1.,
-                norm_eps: 1e-5,
-                norm_num_groups: 32,
-                sliced_attention_size: None,
-                use_linear_projection: true,
-            };
-            unet_2d::UNet2DConditionModel::new(vb, 4, 4, false, unet_cfg)?
+            // LoRA weights are merged into an owned tensor map, so this path
+            // cannot use the mmaped VarBuilder that build_unet relies on.
+            build(VarBuilder::from_tensors(tensors, dtype, device))?
         } else {
-            sd_config.build_unet(unet_weights, device, 4, false, dtype)?
+            // SAFETY: the safetensors file is owned by the HF cache or the
+            // local model directory and is not modified during inference.
+            let vb =
+                unsafe { VarBuilder::from_mmaped_safetensors(&[unet_weights], dtype, device)? };
+            build(vb)?
         }
     };
 

@@ -204,7 +204,7 @@ The two-phase split lets batch runs (`--seed-range`) load weights once instead o
 - Schedulers: `euler-a`, `euler-a-karras`, `dpm2m-karras`. Custom Karras schedulers live in `src/schedulers.rs`.
 - Loads two text encoders (CLIP-1 ViT-L/14, CLIP-2 ViT-bigG) and concatenates embeddings along hidden dim to 2048.
 - Supports LoRA for UNet and both text encoders (`--lora`, `--lora-scale`).
-- Uses `sd_config.build_unet(...)` normally, but when LoRA is present constructs a hardcoded `UNet2DConditionModelConfig` because LoRA-loaded weights cannot use the standard `build_unet` path.
+- Loads the UNet architecture from the model's own `unet/config.json` (diffusers format) for both the plain and LoRA paths; only the VarBuilder differs (mmaped vs LoRA-merged owned tensors).
 - `prepare` loads embeddings (or reuses the disk cache), UNet, and VAE; the UNet stays resident during decode for batch reuse. The scheduler is recreated per `generate` call (`Dpm2mKarrasScheduler` carries mutable per-step state).
 
 ### Device selection (`src/device.rs`)
@@ -272,7 +272,7 @@ Defined in `src/cli.rs` (clap derive). Key flags:
 - **GGUF models force dtype=F32 and DiT on CPU** — quantized weights dequantize to F32; mixing BF16 tensors with F32 weights fails in matmul. The DiT also runs on CPU to avoid device mismatches and Metal OOM.
 - **`--guidance-scale` is SDXL-only** (typical range ~5–10). FLUX dev uses `--flux-guidance` (default 3.5); `schnell` ignores guidance because it is distilled. These are separate flags with different semantics.
 - **SDXL default resolution is 768×1024**, not the SDXL-standard 1024×1024. FLUX defaults to 768×1360.
-- **LoRA config is hardcoded** — when `--lora` is used, `UNet2DConditionModelConfig` is manually constructed in `sdxl/run.rs` because LoRA-loaded weights cannot use the standard `build_unet` path.
+- **UNet architecture comes from `unet/config.json`** — both UNet load paths (with and without LoRA) parse the diffusers config into `UNet2DConditionModelConfig` via `src/sdxl/config.rs`. Only the VarBuilder differs: mmaped safetensors without LoRA, owned tensors after the LoRA merge with `--lora`. CLIP/VAE configs still come from candle's hardcoded `StableDiffusionConfig::sdxl`.
 - **`log.jsonl` appends are atomic** — each entry is formatted into a single string and written with one `write_all` on an append-mode file (`O_APPEND` / `FILE_APPEND_DATA`), so parallel runs cannot interleave lines. Do not switch back to `writeln!` on the raw `File` — its formatting adaptor can split a line across multiple syscalls.
 - **Batch mode continues on failure** — if one seed fails, the loop proceeds to the next seed.
 - **Batch mode keeps weights resident** — `prepare` loads DiT/UNet **and** VAE once; the denoiser stays in memory during VAE decode (tradeoff for fast batch runs). Mitigations on tight memory: `--vae-cpu`, `--vae-tile-size`, GGUF models.
