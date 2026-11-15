@@ -13,11 +13,6 @@
 
 ## 2. Надёжность и управление ресурсами
 
-- [ ] **Загружать конфигурацию SDXL UNet из `unet/config.json`**
-  Убрать ручной `UNet2DConditionModelConfig` из LoRA-пути в `sdxl/run.rs`.
-  Одинаково использовать конфигурацию diffusers с LoRA и без него, чтобы локальные
-  SDXL-модели не зависели от hardcoded параметров Araminta.
-
 - [ ] **Снизить пиковую память при применении LoRA к UNet**
   Сейчас весь UNet материализуется в CPU `HashMap`, изменяется и затем переносится
   на device. Перейти к послойной загрузке/слиянию или другому потоковому варианту,
@@ -144,6 +139,15 @@
 ---
 
 ## Уже реализовано
+
+- [x] **Конфигурация SDXL UNet из `unet/config.json`** — ветка `fix/sdxl-unet-config`.
+  Новый модуль `src/sdxl/config.rs` парсит diffusers-конфиг (`block_out_channels`,
+  `down_block_types`, `attention_head_dim`, `transformer_layers_per_block` — и
+  скалярная, и массивная формы — и остальные поля) в `UNet2DConditionModelConfig`.
+  Оба пути загрузки UNet (с LoRA и без) используют его; отличается только
+  VarBuilder: mmaped safetensors без LoRA, owned tensors после мержа. Неподдерживаемые
+  блоки (`AttnDownBlock2D`) и рассинхрон массивов дают понятную ошибку. Тесты на
+  парсинг SDXL-base конфига, скалярные формы, ошибки.
 
 - [x] **Ошибки чтения embedding cache не скрываются** — PR #39.
   `EmbeddingCache::get` различает тихий miss (`Ok(None)`, записи нет) и `Err` с
