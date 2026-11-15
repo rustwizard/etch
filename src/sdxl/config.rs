@@ -215,11 +215,26 @@ fn validate_mirror_layout(json: &serde_json::Value, down_types: &[&str]) -> Resu
             "up_block_types {up_types:?} do not mirror down_block_types {down_types:?} the way candle builds the up path"
         );
     }
-    if let Some(mid) = optional_str(json, "mid_block_type")? {
-        anyhow::ensure!(
-            mid == "UNetMidBlock2DCrossAttn",
-            "unsupported mid_block_type '{mid}': candle builds UNetMidBlock2DCrossAttn only"
-        );
+    // An absent field means the diffusers default (UNetMidBlock2DCrossAttn,
+    // which is what candle builds). An explicit null is different: diffusers
+    // then creates NO mid block at all, which candle cannot represent — so
+    // reject it instead of silently building a cross-attn mid.
+    match json.get("mid_block_type") {
+        None => {}
+        Some(serde_json::Value::Null) => {
+            anyhow::bail!(
+                "mid_block_type: null means no mid block, which candle cannot build (it always constructs UNetMidBlock2DCrossAttn)"
+            )
+        }
+        Some(v) => {
+            let mid = v
+                .as_str()
+                .with_context(|| format!("field 'mid_block_type' must be a string, got {v}"))?;
+            anyhow::ensure!(
+                mid == "UNetMidBlock2DCrossAttn",
+                "unsupported mid_block_type '{mid}': candle builds UNetMidBlock2DCrossAttn only"
+            );
+        }
     }
     if json
         .get("reverse_transformer_layers_per_block")
@@ -396,6 +411,22 @@ mod tests {
         bad["mid_block_type"] = serde_json::json!("UNetMidBlock2DSimpleCrossAttn");
         let err = parse_unet_config(&bad).expect_err("non-cross-attn mid must fail");
         assert!(format!("{err:#}").contains("mid_block_type"), "{err}");
+
+        // Explicit null means NO mid block in diffusers; candle always builds
+        // one, so it must be rejected rather than treated as the default.
+        let mut bad = json.clone();
+        bad["mid_block_type"] = serde_json::Value::Null;
+        let err = parse_unet_config(&bad).expect_err("null mid_block_type must fail");
+        assert!(format!("{err:#}").contains("null"), "{err}");
+
+        // Absent field keeps the diffusers default of a cross-attn mid (base
+        // fixture has no mid_block_type at all and parses fine).
+        let mut ok = json.clone();
+        ok.as_object_mut().expect("object").remove("mid_block_type");
+        assert!(
+            parse_unet_config(&ok).is_ok(),
+            "absent mid_block_type must parse"
+        );
 
         // Reversed transformer counts are unsupported.
         let mut bad = json.clone();
