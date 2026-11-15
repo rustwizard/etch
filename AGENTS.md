@@ -23,7 +23,7 @@ Key crates (see `Cargo.toml`):
 
 | Crate | Purpose |
 |-------|---------|
-| `candle-core`, `candle-nn`, `candle-transformers` 0.11 | ML framework and model implementations |
+| `candle-core`, `candle-nn`, `candle-transformers` 0.11.1 | ML framework and model implementations |
 | `hf-hub` 0.4 (tokio feature) | HuggingFace Hub downloads |
 | `clap` 4 (derive) | CLI parsing |
 | `image` 0.25 (png, jpeg only) | Saving output images |
