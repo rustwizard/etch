@@ -13,11 +13,23 @@
 
 ## 2. Надёжность и управление ресурсами
 
-- [ ] **Решить судьбу WIP `feature/ssd-streaming`**
-  `forward_streaming.rs` и `unet_structure.rs` ожидают именованные веса, а
-  `LayerStream::next_layer()` возвращает `Vec<Tensor>`; отключённые файлы имеют
-  ошибки компиляции. Либо довести эксперимент до изолированного компилируемого
-  состояния с измеримой выгодой, либо закрыть его и сохранить выводы в ветке/PR.
+- [ ] **`pread`-once для обычного SDXL UNet**
+  Перенести `StreamingTensors` из `lora.rs` в общий модуль и добавить
+  `StreamingBackend` (SimpleBackend без LoRA) для пути без `--lora` в
+  `sdxl/run.rs`. Замер (тёплый embedding cache, Araminta, 512×512, 1 шаг,
+  минимум 3 чередующиеся пары): mmap сейчас даёт ~10,31 GB RSS, ожидается
+  ~6–7 GB. Критерий merge: −25–30% к среднему RSS без заметной деградации
+  denoising. Дорожная карта: PR 0 (закрытие WIP) → этот пункт → замер →
+  только при недостаточности ~6–7 GB — условный forward-streaming spike.
+
+- [ ] **Условный SDXL forward-streaming эксперимент**
+  Начинать только если `pread`-once (~6–7 GB) недостаточно. Ветка-эксперимент
+  `exp/sdxl-forward-streaming`: собирать down/mid/up-блоки через streaming
+  VarBuilder, выполнять публичный Candle forward, удалять веса, синхронизировать
+  device; маленькие компоненты (conv_in, time embedding, conv_out) резидентны.
+  Архитектура из `sdxl/config.rs`, не хардкод Araminta. Kill-критерии: выход
+  не совпадает численно; экономия < 30% относительно `pread`-once; память
+  копится в Metal pool; замедление > ~2×; нужен полный ручной forward.
 
 - [ ] **Добавить проверки Ctrl-C между длительными подэтапами**
   Проверять interrupt между загрузкой крупных компонентов и между VAE-тайлами.
@@ -137,6 +149,16 @@
 
 ## Уже реализовано
 
+- [x] **Закрыт WIP `feature/ssd-streaming`** — ветка `docs/retire-ssd-streaming`.
+  Последнее состояние сохранено по SHA `e0f8240` («wip: preserve SDXL
+  streaming forward + UNet structure analysis»). Причины закрытия: ручной
+  forward не воспроизводит Candle UNet; флаги не были подключены; dense UNet
+  требует чтения 4,782 GiB на каждый forward (20 шагов SDXL ≈ 95,6 GiB I/O);
+  на Metal простой `drop` недостаточен из-за buffer pool; для FLUX нужные
+  Candle API приватны. Новые измерения: обычный mmap SDXL — 10,31 GB RSS;
+  `pread` + LoRA после PR #42 — 6,38 GB RSS. Новая работа ведётся от master
+  по дорожной карте (`pread`-once → замер → условный forward-streaming).
+
 - [x] **Ленивый LoRA-мерж для SDXL UNet** — PR #42.
   Вместо материализации всего UNet в CPU `HashMap` и изменения копии (`apply_lora`
   удалён) UNet собирается через кастомный `SimpleBackend` (`LazyLoraBackend` в
@@ -154,8 +176,7 @@
   с именем тензора, валидация парсера (oversized header, reversed offsets,
   truncated tensor, size mismatch, чтение валидного файла). Всего 54 теста.
   Замер пикового RSS (`araminta` + LoRA `69_sdxl`, `--n-steps 1`, 3 прогона,
-  чередуя бинарники): baseline ≈ 11.05 GB → снижение на размер резидентного
-  файла UNet; замер подтверждён при ревью PR.
+  чередуя бинарники): 11,17 → 6,38 GB (−42,9%).
 
 - [x] **Конфигурация SDXL UNet из `unet/config.json`** — PR #41.
   Новый модуль `src/sdxl/config.rs` парсит diffusers-конфиг (`block_out_channels`,
