@@ -217,6 +217,10 @@ struct TensorLocation {
     shape: Vec<usize>,
 }
 
+/// Generous upper bound for the JSON header. Real safetensors headers are a
+/// few MB at most; anything larger is either corrupt or hostile.
+const MAX_HEADER_LEN: u64 = 100 * 1024 * 1024;
+
 impl StreamingTensors {
     fn open(paths: &[impl AsRef<std::path::Path>]) -> Result<Self> {
         use std::os::unix::fs::FileExt;
@@ -226,6 +230,13 @@ impl StreamingTensors {
             let path = path.as_ref();
             let file = std::fs::File::open(path)
                 .map_err(|e| anyhow::anyhow!("cannot open {}: {e}", path.display()))?;
+            let file_len = file
+                .metadata()
+                .map_err(|e| anyhow::anyhow!("cannot stat {}: {e}", path.display()))?
+                .len();
+            if file_len < 8 {
+                anyhow::bail!("{}: too small to be a safetensors file", path.display());
+            }
             let header_len = {
                 let mut buf = [0u8; 8];
                 file.read_exact_at(&mut buf, 0).map_err(|e| {
@@ -233,7 +244,27 @@ impl StreamingTensors {
                 })?;
                 u64::from_le_bytes(buf)
             };
-            let mut header = vec![0u8; header_len as usize];
+            if header_len > MAX_HEADER_LEN {
+                anyhow::bail!(
+                    "{}: safetensors header too large ({header_len} bytes)",
+                    path.display()
+                );
+            }
+            let data_base = 8u64.checked_add(header_len).ok_or_else(|| {
+                anyhow::anyhow!("{}: safetensors header length overflows", path.display())
+            })?;
+            if data_base > file_len {
+                anyhow::bail!(
+                    "{}: truncated file (header of {header_len} bytes, file is {file_len} bytes)",
+                    path.display()
+                );
+            }
+            let mut header = vec![
+                0u8;
+                usize::try_from(header_len).map_err(|_| {
+                    anyhow::anyhow!("{}: safetensors header too large", path.display())
+                })?
+            ];
             file.read_exact_at(&mut header, 8)
                 .map_err(|e| anyhow::anyhow!("cannot read header of {}: {e}", path.display()))?;
             let header: serde_json::Value = serde_json::from_slice(&header).map_err(|e| {
@@ -245,7 +276,6 @@ impl StreamingTensors {
                     path.display()
                 );
             };
-            let data_base = 8 + header_len;
             for (name, meta) in entries {
                 if name == "__metadata__" {
                     continue;
@@ -271,12 +301,50 @@ impl StreamingTensors {
                     .ok_or_else(|| {
                         anyhow::anyhow!("{}: tensor '{name}' has no data_offsets", path.display())
                     })?;
+                // All offset/size arithmetic is checked: a corrupt file must
+                // produce a readable error, never a panic or a giant
+                // allocation.
+                let [start, end] = offsets;
+                if start > end {
+                    anyhow::bail!(
+                        "{}: tensor '{name}' has reversed data offsets [{start}, {end}]",
+                        path.display()
+                    );
+                }
+                let abs_end = data_base.checked_add(end).ok_or_else(|| {
+                    anyhow::anyhow!("{}: tensor '{name}' data end overflows", path.display())
+                })?;
+                if abs_end > file_len {
+                    anyhow::bail!(
+                        "{}: tensor '{name}' data [{start}, {end}] extends past end of file ({file_len} bytes)",
+                        path.display()
+                    );
+                }
+                let numel: u64 = shape
+                    .iter()
+                    .try_fold(1u64, |acc, &d| acc.checked_mul(d as u64))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("{}: tensor '{name}' shape overflows", path.display())
+                    })?;
+                let expected_len =
+                    numel
+                        .checked_mul(dtype.size_in_bytes() as u64)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("{}: tensor '{name}' size overflows", path.display())
+                        })?;
+                let len = end - start;
+                if len != expected_len {
+                    anyhow::bail!(
+                        "{}: tensor '{name}' has {len} data bytes, expected {expected_len} for shape {shape:?} and dtype {dtype:?}",
+                        path.display()
+                    );
+                }
                 index.insert(
                     name.clone(),
                     TensorLocation {
                         file: file_idx,
-                        offset: data_base + offsets[0],
-                        len: offsets[1] - offsets[0],
+                        offset: data_base + start,
+                        len,
                         dtype,
                         shape,
                     },
@@ -786,6 +854,131 @@ mod tests {
         assert!(backend.contains_tensor("plain.weight"));
         assert!(!backend.contains_tensor("absent.weight"));
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Hand-craft a raw safetensors file: 8-byte LE header length + JSON
+    /// header + tensor data.
+    fn raw_st_file(header: &serde_json::Value, data: &[u8]) -> Vec<u8> {
+        let header = serde_json::to_vec(header).expect("serialize header");
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(&header);
+        file.extend_from_slice(data);
+        file
+    }
+
+    fn open_raw(dir: &std::path::Path, bytes: &[u8]) -> Result<StreamingTensors> {
+        let path = dir.join("corrupt.safetensors");
+        std::fs::write(&path, bytes).expect("write corrupt file");
+        StreamingTensors::open(&[path])
+    }
+
+    /// StreamingTensors has no Debug impl, so expect_err does not apply.
+    fn expect_open_err(dir: &std::path::Path, bytes: &[u8], what: &str) -> anyhow::Error {
+        match open_raw(dir, bytes) {
+            Ok(_) => panic!("{what}: corrupt file must be rejected"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn streaming_rejects_oversized_header() {
+        let dir = std::env::temp_dir().join(format!(
+            "etch-st-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // header_len = u64::MAX would try to allocate ~18 exabytes.
+        let err = expect_open_err(&dir, &u64::MAX.to_le_bytes(), "oversized header");
+        assert!(format!("{err:#}").contains("header too large"), "{err:#}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn streaming_rejects_reversed_offsets() {
+        let dir = std::env::temp_dir().join(format!(
+            "etch-st-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let header = serde_json::json!({
+            "t": {"dtype": "F32", "shape": [1], "data_offsets": [8, 0]},
+        });
+        let err = expect_open_err(&dir, &raw_st_file(&header, &[0u8; 8]), "reversed offsets");
+        assert!(
+            format!("{err:#}").contains("reversed data offsets"),
+            "{err:#}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn streaming_rejects_truncated_tensor() {
+        let dir = std::env::temp_dir().join(format!(
+            "etch-st-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // Declares 16 bytes of data but the file ends after 4.
+        let header = serde_json::json!({
+            "t": {"dtype": "F32", "shape": [4], "data_offsets": [0, 16]},
+        });
+        let err = expect_open_err(&dir, &raw_st_file(&header, &[0u8; 4]), "truncated tensor");
+        assert!(
+            format!("{err:#}").contains("extends past end of file"),
+            "{err:#}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn streaming_rejects_size_mismatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "etch-st-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // 4 F32 values need 16 bytes; the entry claims 8.
+        let header = serde_json::json!({
+            "t": {"dtype": "F32", "shape": [4], "data_offsets": [0, 8]},
+        });
+        let err = expect_open_err(&dir, &raw_st_file(&header, &[0u8; 8]), "size mismatch");
+        assert!(
+            format!("{err:#}").contains("data bytes, expected"),
+            "{err:#}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn streaming_reads_valid_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "etch-st-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let header = serde_json::json!({
+            "t": {"dtype": "F32", "shape": [2], "data_offsets": [0, 8]},
+        });
+        let st = open_raw(
+            &dir,
+            &raw_st_file(
+                &header,
+                &1.0f32
+                    .to_le_bytes()
+                    .into_iter()
+                    .chain(2.0f32.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            ),
+        )
+        .expect("valid file opens");
+        let t = st.read("t", &Device::Cpu).expect("read").expect("present");
+        assert_eq!(t.to_vec1::<f32>().expect("vec"), vec![1.0, 2.0]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
