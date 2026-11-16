@@ -299,19 +299,20 @@ fn prepare_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<SdxlPrepar
         if let Some(lora) = &lora_map {
             // Merge LoRA lazily per weight through a custom backend: the full
             // UNet is never materialized on the CPU (that double copy was the
-            // memory peak of prepare); each layer loads from the mmaped file,
-            // merges on the CPU, and moves straight to the device.
-            // SAFETY: the safetensors file is owned by the HF cache or the
-            // local model directory and is not modified during inference.
-            let base = unsafe { candle_core::safetensors::MmapedSafetensors::new(&unet_weights)? };
-            let names: Vec<String> = base.tensors().into_iter().map(|(n, _)| n).collect();
-            let plan = lora::build_unet_lora_plan(&names, lora, args.lora_scale)?;
+            // memory peak of prepare), and the base file is streamed tensor by
+            // tensor instead of mmaped — an mmap would keep every touched page
+            // resident in RSS, defeating the whole point. Each layer is read
+            // with a positional read, merged on the CPU if planned, and moved
+            // straight to the device.
+            let (backend, applied) = lora::LazyLoraBackend::open(
+                std::slice::from_ref(&unet_weights),
+                lora,
+                args.lora_scale,
+            )?;
             info!(
                 "Applying UNet LoRA (scale {}) to {} layers",
-                args.lora_scale,
-                plan.applied()
+                args.lora_scale, applied
             );
-            let backend = lora::LazyLoraBackend::new(base, std::sync::Arc::clone(lora), plan);
             build(VarBuilder::from_backend(
                 Box::new(backend),
                 dtype,

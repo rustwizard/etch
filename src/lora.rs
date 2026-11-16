@@ -193,34 +193,190 @@ fn merge_lora_layer(
     Ok(Some(merge_lora_weight(w, lora_up, lora_down, scale)?))
 }
 
+/// Index over one or more safetensors files that reads tensors on demand
+/// with positional reads instead of memory-mapping the files.
+///
+/// A long-lived full-file mmap keeps every touched page resident in the
+/// process RSS for the mapping's lifetime, and model construction touches
+/// practically all of them — so an mmaped base defeats the peak-RSS goal of
+/// the LoRA path. Positional reads go through the page cache instead: the
+/// bytes are copied into a small transient buffer, moved to the device, and
+/// freed, so the process RSS grows by one tensor at a time, not by the whole
+/// file.
+struct StreamingTensors {
+    files: Vec<std::fs::File>,
+    index: HashMap<String, TensorLocation>,
+}
+
+struct TensorLocation {
+    file: usize,
+    /// Absolute byte offset of the tensor data in the file.
+    offset: u64,
+    len: u64,
+    dtype: DType,
+    shape: Vec<usize>,
+}
+
+impl StreamingTensors {
+    fn open(paths: &[impl AsRef<std::path::Path>]) -> Result<Self> {
+        use std::os::unix::fs::FileExt;
+        let mut files = Vec::with_capacity(paths.len());
+        let mut index = HashMap::new();
+        for (file_idx, path) in paths.iter().enumerate() {
+            let path = path.as_ref();
+            let file = std::fs::File::open(path)
+                .map_err(|e| anyhow::anyhow!("cannot open {}: {e}", path.display()))?;
+            let header_len = {
+                let mut buf = [0u8; 8];
+                file.read_exact_at(&mut buf, 0).map_err(|e| {
+                    anyhow::anyhow!("cannot read header of {}: {e}", path.display())
+                })?;
+                u64::from_le_bytes(buf)
+            };
+            let mut header = vec![0u8; header_len as usize];
+            file.read_exact_at(&mut header, 8)
+                .map_err(|e| anyhow::anyhow!("cannot read header of {}: {e}", path.display()))?;
+            let header: serde_json::Value = serde_json::from_slice(&header).map_err(|e| {
+                anyhow::anyhow!("bad safetensors header in {}: {e}", path.display())
+            })?;
+            let Some(entries) = header.as_object() else {
+                anyhow::bail!(
+                    "bad safetensors header in {}: not an object",
+                    path.display()
+                );
+            };
+            let data_base = 8 + header_len;
+            for (name, meta) in entries {
+                if name == "__metadata__" {
+                    continue;
+                }
+                let dtype = meta.get("dtype").and_then(|v| v.as_str()).ok_or_else(|| {
+                    anyhow::anyhow!("{}: tensor '{name}' has no dtype", path.display())
+                })?;
+                let dtype = dtype_from_str(dtype).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{}: tensor '{name}' has unsupported dtype '{dtype}'",
+                        path.display()
+                    )
+                })?;
+                let shape: Vec<usize> = meta
+                    .get("shape")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("{}: tensor '{name}' has no shape", path.display())
+                    })?;
+                let offsets: [u64; 2] = meta
+                    .get("data_offsets")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("{}: tensor '{name}' has no data_offsets", path.display())
+                    })?;
+                index.insert(
+                    name.clone(),
+                    TensorLocation {
+                        file: file_idx,
+                        offset: data_base + offsets[0],
+                        len: offsets[1] - offsets[0],
+                        dtype,
+                        shape,
+                    },
+                );
+            }
+            files.push(file);
+        }
+        Ok(Self { files, index })
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.index.contains_key(name)
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.index.keys().cloned().collect()
+    }
+
+    fn read(&self, name: &str, dev: &candle_core::Device) -> candle_core::Result<Option<Tensor>> {
+        use std::os::unix::fs::FileExt;
+        let Some(loc) = self.index.get(name) else {
+            return Ok(None);
+        };
+        let mut buf = vec![0u8; loc.len as usize];
+        self.files[loc.file]
+            .read_exact_at(&mut buf, loc.offset)
+            .map_err(|e| {
+                candle_core::Error::wrap(std::io::Error::new(
+                    e.kind(),
+                    format!("cannot read tensor '{name}': {e}"),
+                ))
+            })?;
+        Ok(Some(Tensor::from_raw_buffer(
+            &buf, loc.dtype, &loc.shape, dev,
+        )?))
+    }
+}
+
+fn dtype_from_str(s: &str) -> Option<DType> {
+    Some(match s {
+        "F64" => DType::F64,
+        "F32" => DType::F32,
+        "F16" => DType::F16,
+        "BF16" => DType::BF16,
+        "I64" => DType::I64,
+        "I32" => DType::I32,
+        "I16" => DType::I16,
+        "U8" => DType::U8,
+        "U32" => DType::U32,
+        _ => return None,
+    })
+}
+
 /// VarBuilder backend that applies planned LoRA merges lazily while the UNet
-/// is constructed: weights without a merge load straight from the mmaped
-/// safetensors onto the target device (no full CPU copy ever exists); merged
-/// weights are loaded one layer at a time on the CPU, merged in F32, and
-/// moved to the device. Peak memory during `prepare` drops from ~2 full UNet
-/// copies to the resident model plus one layer's worth of temporaries.
+/// is constructed. Weights without a merge are streamed straight from the
+/// base safetensors onto the target device (no mmap, no full CPU copy);
+/// merged weights are loaded one layer at a time on the CPU, merged in F32,
+/// and moved to the device. Peak memory during `prepare` is the resident
+/// model plus one layer's worth of temporaries.
 pub struct LazyLoraBackend {
-    base: candle_core::safetensors::MmapedSafetensors,
+    base: StreamingTensors,
     lora: std::sync::Arc<HashMap<String, Tensor>>,
     plan: LoraPlan,
 }
 
 impl LazyLoraBackend {
-    pub fn new(
-        base: candle_core::safetensors::MmapedSafetensors,
-        lora: std::sync::Arc<HashMap<String, Tensor>>,
-        plan: LoraPlan,
-    ) -> Self {
-        Self { base, lora, plan }
+    /// Open the base safetensors files, build the merge plan from their
+    /// tensor names, and return the backend plus the number of layers the
+    /// plan applies to (for logging).
+    pub fn open(
+        base_paths: &[impl AsRef<std::path::Path>],
+        lora: &std::sync::Arc<HashMap<String, Tensor>>,
+        lora_scale: f64,
+    ) -> Result<(Self, usize)> {
+        let base = StreamingTensors::open(base_paths)?;
+        let plan = build_unet_lora_plan(&base.names(), lora, lora_scale)?;
+        let applied = plan.applied();
+        Ok((
+            Self {
+                base,
+                lora: std::sync::Arc::clone(lora),
+                plan,
+            },
+            applied,
+        ))
     }
 
     fn load_merged(&self, name: &str, dev: &candle_core::Device) -> candle_core::Result<Tensor> {
         match self.plan.merges().get(name) {
-            None => self.base.load(name, dev),
+            None => self
+                .base
+                .read(name, dev)?
+                .ok_or_else(|| candle_core::Error::msg(format!("tensor '{name}' not found"))),
             Some(spec) => {
                 // One base layer at a time on the CPU; the merged tensor is
                 // moved to the device right away.
-                let base = self.base.load(name, &candle_core::Device::Cpu)?;
+                let base = self
+                    .base
+                    .read(name, &candle_core::Device::Cpu)?
+                    .ok_or_else(|| candle_core::Error::msg(format!("tensor '{name}' not found")))?;
                 let lora_up = self.lora.get(&spec.up).ok_or_else(|| {
                     candle_core::Error::msg(format!("LoRA tensor '{}' missing", spec.up))
                 })?;
@@ -264,7 +420,7 @@ impl candle_nn::var_builder::SimpleBackend for LazyLoraBackend {
     }
 
     fn contains_tensor(&self, name: &str) -> bool {
-        self.base.get(name).is_ok()
+        self.base.contains(name)
     }
 }
 
@@ -586,12 +742,9 @@ mod tests {
         candle_core::safetensors::save(&base_map, &st_path).expect("save base");
 
         let lora = std::sync::Arc::new(diffusers_lora(None));
-        // SAFETY: the test file is not modified while mapped.
-        let base =
-            unsafe { candle_core::safetensors::MmapedSafetensors::new(&st_path).expect("mmap") };
-        let names: Vec<String> = base.tensors().into_iter().map(|(n, _)| n).collect();
-        let plan = build_unet_lora_plan(&names, &lora, 0.5).expect("plan");
-        let backend = LazyLoraBackend::new(base, lora, plan);
+        let (backend, applied) =
+            LazyLoraBackend::open(&[st_path], &lora, 0.5).expect("open backend");
+        assert_eq!(applied, 1, "one planned merge");
 
         use candle_nn::var_builder::SimpleBackend as _;
         let got = backend
@@ -650,12 +803,7 @@ mod tests {
         candle_core::safetensors::save(&base_map, &st_path).expect("save base");
 
         let lora = std::sync::Arc::new(diffusers_lora(None));
-        // SAFETY: the test file is not modified while mapped.
-        let base =
-            unsafe { candle_core::safetensors::MmapedSafetensors::new(&st_path).expect("mmap") };
-        let names: Vec<String> = base.tensors().into_iter().map(|(n, _)| n).collect();
-        let plan = build_unet_lora_plan(&names, &lora, 1.0).expect("plan");
-        let backend = LazyLoraBackend::new(base, lora, plan);
+        let (backend, _) = LazyLoraBackend::open(&[st_path], &lora, 1.0).expect("open backend");
 
         use candle_nn::var_builder::SimpleBackend as _;
         let err = backend
