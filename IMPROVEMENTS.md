@@ -13,11 +13,6 @@
 
 ## 2. Надёжность и управление ресурсами
 
-- [ ] **Снизить пиковую память при применении LoRA к UNet**
-  Сейчас весь UNet материализуется в CPU `HashMap`, изменяется и затем переносится
-  на device. Перейти к послойной загрузке/слиянию или другому потоковому варианту,
-  измерив пиковую RAM до и после. Не смешивать эту задачу с общим SSD streaming.
-
 - [ ] **Решить судьбу WIP `feature/ssd-streaming`**
   `forward_streaming.rs` и `unet_structure.rs` ожидают именованные веса, а
   `LayerStream::next_layer()` возвращает `Vec<Tensor>`; отключённые файлы имеют
@@ -119,9 +114,11 @@
 
 ## 7. Документация и мелкие улучшения
 
-- [ ] **Добавить doc-комментарии для `apply_lora` / `apply_te_lora`**
-  Описать поддерживаемые форматы, возвращаемые коллекции, счётчик применённых
-  слоёв, поведение при unmatched keys и отсутствие runtime LoRA после merge.
+- [ ] **Дополнить doc-комментарии для API LoRA в `src/lora.rs`**
+  После перехода на ленивый мерж публичный API: `merge_lora_weight`,
+  `build_unet_lora_plan`, `LoraPlan`, `LazyLoraBackend`, `apply_te_lora`.
+  Описать поддерживаемые форматы, счётчик применённых слоёв,
+  поведение при unmatched keys и отсутствие runtime LoRA после мержа.
 
 - [ ] **Добавить ссылки на источники констант scheduler'ов**
   Пояснить `BETA_START=0.00085`, `BETA_END=0.012`, `TRAIN_STEPS=1000`,
@@ -140,12 +137,31 @@
 
 ## Уже реализовано
 
+- [x] **Ленивый LoRA-мерж для SDXL UNet** — ветка `perf/lazy-lora-merge`.
+  Вместо материализации всего UNet в CPU `HashMap` и изменения копии (`apply_lora`
+  удалён) UNet собирается через кастомный `SimpleBackend` (`LazyLoraBackend` в
+  `src/lora.rs`): базовые веса стримятся из safetensors послойно позиционными
+  чтениями (`pread`, без mmap — mmap держал бы все затронутые страницы в RSS
+  на всё время сборки и съедял бы выигрыш), мёрженные вычисляются послойно
+  (`W + scale * U @ D` на F32) и сразу уходят на device. Пиковая RAM при
+  `--lora`: была полная CPU-копия UNet (~5+ GB), стала одна раскладка
+  (M + L + максимальный вес). Математика общая для UNet и text-энкодеров
+  (`merge_lora_weight`), набор мёрженных тензоров строится один раз
+  (`build_unet_lora_plan`: diffusers (`lora_unet_`, `alpha` опционален) →
+  ldm/ComfyUI fallback с той же семантикой и ранней ошибкой при нуле
+  совпадений). Тесты: планирование обоих форматов/alpha/неполные пары/
+  zero-match, точная математика мержа, равенство lazy vs eager, ошибки shape
+  с именем тензора. Всего 49 тестов.
+  Замер пикового RSS (`araminta` + LoRA `69_sdxl`, `--n-steps 1`, 3 прогона,
+  чередуя бинарники): baseline ≈ 11.05 GB → новый бинарник — см. PR.
+
 - [x] **Конфигурация SDXL UNet из `unet/config.json`** — PR #41.
   Новый модуль `src/sdxl/config.rs` парсит diffusers-конфиг (`block_out_channels`,
   `down_block_types`, `attention_head_dim`, `transformer_layers_per_block` — и
   скалярная, и массивная формы — и остальные поля) в `UNet2DConditionModelConfig`.
   Оба пути загрузки UNet (с LoRA и без) используют его; отличается только
-  VarBuilder: mmaped safetensors без LoRA, owned tensors после мержа. Неподдерживаемые
+  VarBuilder: mmaped safetensors без LoRA, `LazyLoraBackend` (стриминг +
+  послойный мерж) с LoRA. Неподдерживаемые
   блоки (`AttnDownBlock2D`) и рассинхрон массивов дают понятную ошибку. Тесты на
   парсинг SDXL-base конфига, скалярные формы, ошибки.
 

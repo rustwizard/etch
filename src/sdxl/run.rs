@@ -138,14 +138,14 @@ fn prepare_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<SdxlPrepar
     };
 
     // Load LoRA weights once; shared across UNet and both text encoders.
-    let lora_map: Option<HashMap<String, Tensor>> = if let Some(p) = &args.lora {
+    let lora_map: Option<std::sync::Arc<HashMap<String, Tensor>>> = if let Some(p) = &args.lora {
         info!("Loading LoRA: {p} (scale {})", args.lora_scale);
         let map = candle_core::safetensors::load(p, &Device::Cpu)?;
         anyhow::ensure!(
             map.keys().any(|k| k.ends_with(".lora_down.weight")),
             "{p}: no LoRA keys found (expected keys ending in .lora_down.weight) — is this a valid LoRA file?"
         );
-        Some(map)
+        Some(std::sync::Arc::new(map))
     } else {
         None
     };
@@ -247,7 +247,9 @@ fn prepare_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<SdxlPrepar
                 &tok1,
                 te1_path,
                 &sd_config.clip,
-                lora_map.as_ref().map(|m| (m, "lora_te1_", args.lora_scale)),
+                lora_map
+                    .as_ref()
+                    .map(|m| (m.as_ref(), "lora_te1_", args.lora_scale)),
             )?;
             let clip2_config = sd_config
                 .clip2
@@ -260,7 +262,9 @@ fn prepare_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<SdxlPrepar
                 &tok2,
                 te2_path,
                 clip2_config,
-                lora_map.as_ref().map(|m| (m, "lora_te2_", args.lora_scale)),
+                lora_map
+                    .as_ref()
+                    .map(|m| (m.as_ref(), "lora_te2_", args.lora_scale)),
             )?;
 
             let mut save_map = HashMap::new();
@@ -293,12 +297,27 @@ fn prepare_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<SdxlPrepar
             )
         };
         if let Some(lora) = &lora_map {
-            info!("Applying UNet LoRA (scale {})", args.lora_scale);
-            let mut tensors = candle_core::safetensors::load(&unet_weights, &Device::Cpu)?;
-            tensors = lora::apply_lora(tensors, lora, args.lora_scale)?;
-            // LoRA weights are merged into an owned tensor map, so this path
-            // cannot use the mmaped VarBuilder that build_unet relies on.
-            build(VarBuilder::from_tensors(tensors, dtype, device))?
+            // Merge LoRA lazily per weight through a custom backend: the full
+            // UNet is never materialized on the CPU (that double copy was the
+            // memory peak of prepare), and the base file is streamed tensor by
+            // tensor instead of mmaped — an mmap would keep every touched page
+            // resident in RSS, defeating the whole point. Each layer is read
+            // with a positional read, merged on the CPU if planned, and moved
+            // straight to the device.
+            let (backend, applied) = lora::LazyLoraBackend::open(
+                std::slice::from_ref(&unet_weights),
+                lora,
+                args.lora_scale,
+            )?;
+            info!(
+                "Applying UNet LoRA (scale {}) to {} layers",
+                args.lora_scale, applied
+            );
+            build(VarBuilder::from_backend(
+                Box::new(backend),
+                dtype,
+                device.clone(),
+            ))?
         } else {
             // SAFETY: the safetensors file is owned by the HF cache or the
             // local model directory and is not modified during inference.
