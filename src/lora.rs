@@ -2,37 +2,91 @@ use anyhow::Result;
 use candle_core::{DType, Tensor};
 use std::collections::HashMap;
 
-pub fn apply_lora(
-    mut tensors: HashMap<String, Tensor>,
+/// Merge one LoRA delta into a base weight: `base + scale * (up @ down)`,
+/// computed in F32 and cast back to the base dtype. Shared by the eager
+/// text-encoder path and the lazy UNet backend so both cannot diverge.
+pub fn merge_lora_weight(
+    w: &Tensor,
+    lora_up: &Tensor,
+    lora_down: &Tensor,
+    scale: f64,
+) -> candle_core::Result<Tensor> {
+    let delta = (lora_up
+        .to_dtype(DType::F32)?
+        .matmul(&lora_down.to_dtype(DType::F32)?)?
+        * scale)?;
+    let orig = w.dtype();
+    (w.to_dtype(DType::F32)? + delta)?.to_dtype(orig)
+}
+
+/// Effective merge scale for one LoRA layer: `lora_scale * alpha / rank` when
+/// the file carries an alpha tensor, plain `lora_scale` otherwise.
+fn merge_scale(
+    lora: &HashMap<String, Tensor>,
+    lora_base: &str,
+    rank: usize,
+    lora_scale: f64,
+) -> Result<f64> {
+    if let Some(alpha) = lora.get(&format!("{lora_base}.alpha")) {
+        Ok(lora_scale * alpha.to_dtype(DType::F32)?.to_vec0::<f32>()? as f64 / rank as f64)
+    } else {
+        Ok(lora_scale)
+    }
+}
+
+/// A single planned UNet merge: which LoRA tensors patch `weight_key` and at
+/// what scale. Resolved up front so the lazy backend never touches key
+/// mapping and the zero-match case fails before the UNet is constructed.
+#[derive(Debug)]
+pub struct MergeSpec {
+    pub up: String,
+    pub down: String,
+    pub scale: f64,
+}
+
+/// Pre-resolved LoRA-to-UNet match plan (see `build_unet_lora_plan`).
+#[derive(Debug, Default)]
+pub struct LoraPlan {
+    merges: HashMap<String, MergeSpec>,
+}
+
+impl LoraPlan {
+    pub fn applied(&self) -> usize {
+        self.merges.len()
+    }
+
+    pub(crate) fn merges(&self) -> &HashMap<String, MergeSpec> {
+        &self.merges
+    }
+}
+
+/// Map a UNet LoRA file onto UNet weight names without loading any UNet
+/// weights. Mirrors the original eager `apply_lora` semantics exactly:
+/// diffusers-format keys first, the ldm/ComfyUI mapping only when the first
+/// pass matched nothing, incomplete down/up pairs are not matches, and zero
+/// matches are a hard error.
+pub fn build_unet_lora_plan(
+    unet_names: &[String],
     lora: &HashMap<String, Tensor>,
     lora_scale: f64,
-) -> Result<HashMap<String, Tensor>> {
-    let mut applied = 0usize;
+) -> Result<LoraPlan> {
+    let mut merges = HashMap::new();
 
-    // ── Pass 1: diffusers format ─────────────────────────────────────────────
+    // ── Pass 1: diffusers format ────────────────────────────────────────────
     // UNet key "a.b.c.weight" → LoRA base "lora_unet_a_b_c"
-    {
-        let weight_keys: Vec<String> = tensors
-            .keys()
-            .filter(|k| k.ends_with(".weight"))
-            .cloned()
-            .collect();
-        for weight_key in weight_keys {
-            let base = weight_key.strip_suffix(".weight").expect("filtered");
-            let lora_base = format!("lora_unet_{}", base.replace('.', "_"));
-            if let Some(merged) =
-                merge_lora_layer(&tensors, lora, &weight_key, &lora_base, lora_scale)?
-            {
-                tensors.insert(weight_key, merged);
-                applied += 1;
-            }
+    for weight_key in unet_names.iter().filter(|k| k.ends_with(".weight")) {
+        let base = weight_key.strip_suffix(".weight").expect("filtered");
+        let lora_base = format!("lora_unet_{}", base.replace('.', "_"));
+        if let Some(spec) = plan_lora_layer(lora, &lora_base, lora_scale)? {
+            merges.insert(weight_key.clone(), spec);
         }
     }
 
     // ── Pass 2: ldm / ComfyUI format ────────────────────────────────────────
     // LoRA base "lora_unet_input_blocks_N_M_..." → UNet key via block mapping.
     // Only runs when Pass 1 matched nothing (avoids double-applying).
-    if applied == 0 {
+    if merges.is_empty() {
+        let unet_name_set: std::collections::HashSet<&String> = unet_names.iter().collect();
         let lora_bases: Vec<String> = lora
             .keys()
             .filter_map(|k| k.strip_suffix(".lora_down.weight"))
@@ -46,14 +100,11 @@ pub fn apply_lora(
                 skipped += 1;
                 continue;
             };
-            if !tensors.contains_key(&unet_key) {
+            if !unet_name_set.contains(&unet_key) {
                 continue;
             }
-            if let Some(merged) =
-                merge_lora_layer(&tensors, lora, &unet_key, &lora_full_base, lora_scale)?
-            {
-                tensors.insert(unet_key, merged);
-                applied += 1;
+            if let Some(spec) = plan_lora_layer(lora, &lora_full_base, lora_scale)? {
+                merges.insert(unet_key, spec);
             }
         }
         if skipped > 0 {
@@ -61,12 +112,31 @@ pub fn apply_lora(
         }
     }
 
-    if applied == 0 {
+    if merges.is_empty() {
         let sample: Vec<_> = lora.keys().take(5).collect();
         anyhow::bail!("LoRA matched 0 UNet layers.\nFirst keys in file: {sample:?}");
     }
-    tracing::info!("LoRA applied to {applied} layers");
-    Ok(tensors)
+    tracing::info!("UNet LoRA will merge into {} layers", merges.len());
+    Ok(LoraPlan { merges })
+}
+
+fn plan_lora_layer(
+    lora: &HashMap<String, Tensor>,
+    lora_base: &str,
+    lora_scale: f64,
+) -> Result<Option<MergeSpec>> {
+    let down_key = format!("{lora_base}.lora_down.weight");
+    let up_key = format!("{lora_base}.lora_up.weight");
+    let (Some(lora_down), Some(_lora_up)) = (lora.get(&down_key), lora.get(&up_key)) else {
+        return Ok(None);
+    };
+    let rank = lora_down.dim(0)?;
+    let scale = merge_scale(lora, lora_base, rank, lora_scale)?;
+    Ok(Some(MergeSpec {
+        up: up_key,
+        down: down_key,
+        scale,
+    }))
 }
 
 pub fn apply_te_lora(
@@ -112,25 +182,90 @@ fn merge_lora_layer(
     lora_base: &str,
     lora_scale: f64,
 ) -> Result<Option<Tensor>> {
-    let (Some(lora_down), Some(lora_up)) = (
-        lora.get(&format!("{lora_base}.lora_down.weight")),
-        lora.get(&format!("{lora_base}.lora_up.weight")),
-    ) else {
+    let down_key = format!("{lora_base}.lora_down.weight");
+    let up_key = format!("{lora_base}.lora_up.weight");
+    let (Some(lora_down), Some(lora_up)) = (lora.get(&down_key), lora.get(&up_key)) else {
         return Ok(None);
     };
     let rank = lora_down.dim(0)?;
-    let scale = if let Some(alpha) = lora.get(&format!("{lora_base}.alpha")) {
-        lora_scale * alpha.to_dtype(DType::F32)?.to_vec0::<f32>()? as f64 / rank as f64
-    } else {
-        lora_scale
-    };
-    let delta = (lora_up
-        .to_dtype(DType::F32)?
-        .matmul(&lora_down.to_dtype(DType::F32)?)?
-        * scale)?;
+    let scale = merge_scale(lora, lora_base, rank, lora_scale)?;
     let w = tensors.get(weight_key).expect("caller checked");
-    let orig = w.dtype();
-    Ok(Some((w.to_dtype(DType::F32)? + delta)?.to_dtype(orig)?))
+    Ok(Some(merge_lora_weight(w, lora_up, lora_down, scale)?))
+}
+
+/// VarBuilder backend that applies planned LoRA merges lazily while the UNet
+/// is constructed: weights without a merge load straight from the mmaped
+/// safetensors onto the target device (no full CPU copy ever exists); merged
+/// weights are loaded one layer at a time on the CPU, merged in F32, and
+/// moved to the device. Peak memory during `prepare` drops from ~2 full UNet
+/// copies to the resident model plus one layer's worth of temporaries.
+pub struct LazyLoraBackend {
+    base: candle_core::safetensors::MmapedSafetensors,
+    lora: std::sync::Arc<HashMap<String, Tensor>>,
+    plan: LoraPlan,
+}
+
+impl LazyLoraBackend {
+    pub fn new(
+        base: candle_core::safetensors::MmapedSafetensors,
+        lora: std::sync::Arc<HashMap<String, Tensor>>,
+        plan: LoraPlan,
+    ) -> Self {
+        Self { base, lora, plan }
+    }
+
+    fn load_merged(&self, name: &str, dev: &candle_core::Device) -> candle_core::Result<Tensor> {
+        match self.plan.merges().get(name) {
+            None => self.base.load(name, dev),
+            Some(spec) => {
+                // One base layer at a time on the CPU; the merged tensor is
+                // moved to the device right away.
+                let base = self.base.load(name, &candle_core::Device::Cpu)?;
+                let lora_up = self.lora.get(&spec.up).ok_or_else(|| {
+                    candle_core::Error::msg(format!("LoRA tensor '{}' missing", spec.up))
+                })?;
+                let lora_down = self.lora.get(&spec.down).ok_or_else(|| {
+                    candle_core::Error::msg(format!("LoRA tensor '{}' missing", spec.down))
+                })?;
+                merge_lora_weight(&base, lora_up, lora_down, spec.scale)?.to_device(dev)
+            }
+        }
+    }
+}
+
+impl candle_nn::var_builder::SimpleBackend for LazyLoraBackend {
+    fn get(
+        &self,
+        s: candle_core::Shape,
+        name: &str,
+        _: candle_nn::Init,
+        dtype: DType,
+        dev: &candle_core::Device,
+    ) -> candle_core::Result<Tensor> {
+        let tensor = self.load_merged(name, dev)?.to_dtype(dtype)?;
+        if tensor.shape() != &s {
+            Err(candle_core::Error::UnexpectedShape {
+                msg: format!("shape mismatch for {name}"),
+                expected: s,
+                got: tensor.shape().clone(),
+            })
+        } else {
+            Ok(tensor)
+        }
+    }
+
+    fn get_unchecked(
+        &self,
+        name: &str,
+        dtype: DType,
+        dev: &candle_core::Device,
+    ) -> candle_core::Result<Tensor> {
+        self.load_merged(name, dev)?.to_dtype(dtype)
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        self.base.get(name).is_ok()
+    }
 }
 
 /// Converts the inner part of a TE LoRA base (after stripping "lora_te1_" / "lora_te2_")
@@ -289,4 +424,251 @@ fn ldm_suffix_to_diffusers(s: &str) -> String {
         ("norm3", "norm3"),
     ];
     greedy_tokenize(s, TOKENS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+
+    /// down_blocks.1.attentions.0.transformer_blocks.0.attn1.to_q.weight
+    const W_KEY: &str = "down_blocks.1.attentions.0.transformer_blocks.0.attn1.to_q.weight";
+    const LORA_BASE: &str = "lora_unet_down_blocks_1_attentions_0_transformer_blocks_0_attn1_to_q";
+
+    fn t2(data: &[f32], d0: usize, d1: usize) -> Tensor {
+        Tensor::from_slice(data, (d0, d1), &Device::Cpu).expect("test tensor")
+    }
+
+    /// rank=4, in=8 down; out=3, rank=4 up; valid pair for a (3, 8) weight.
+    fn diffusers_lora(alpha: Option<f32>) -> HashMap<String, Tensor> {
+        let mut lora = HashMap::new();
+        lora.insert(
+            format!("{LORA_BASE}.lora_down.weight"),
+            // One-hot rows: row r has 0.5 in column r, so delta lands 0.5 on
+            // the diagonal and expectations stay obvious.
+            t2(
+                &[
+                    0.5, 0., 0., 0., 0., 0., 0., 0., //
+                    0., 0.5, 0., 0., 0., 0., 0., 0., //
+                    0., 0., 0.5, 0., 0., 0., 0., 0., //
+                    0., 0., 0., 0.5, 0., 0., 0., 0.,
+                ],
+                4,
+                8,
+            ),
+        );
+        lora.insert(
+            format!("{LORA_BASE}.lora_up.weight"),
+            t2(&[1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0.], 3, 4),
+        );
+        if let Some(a) = alpha {
+            lora.insert(
+                format!("{LORA_BASE}.alpha"),
+                Tensor::new(a, &Device::Cpu).expect("alpha tensor"),
+            );
+        }
+        lora
+    }
+
+    fn unet_names() -> Vec<String> {
+        vec![W_KEY.to_string(), "other.weight".to_string()]
+    }
+
+    #[test]
+    fn plan_diffusers_format_with_alpha() {
+        let lora = diffusers_lora(Some(2.0));
+        let plan = build_unet_lora_plan(&unet_names(), &lora, 0.5).expect("plan builds");
+        assert_eq!(plan.applied(), 1);
+        let spec = plan.merges().get(W_KEY).expect("W_KEY planned");
+        assert_eq!(spec.up, format!("{LORA_BASE}.lora_up.weight"));
+        assert_eq!(spec.down, format!("{LORA_BASE}.lora_down.weight"));
+        // scale = lora_scale * alpha / rank = 0.5 * 2 / 4
+        assert_eq!(spec.scale, 0.25);
+    }
+
+    #[test]
+    fn plan_without_alpha_uses_lora_scale() {
+        let lora = diffusers_lora(None);
+        let plan = build_unet_lora_plan(&unet_names(), &lora, 0.75).expect("plan builds");
+        assert_eq!(plan.merges().get(W_KEY).expect("planned").scale, 0.75);
+    }
+
+    #[test]
+    fn plan_zero_matches_errors() {
+        let mut lora = HashMap::new();
+        lora.insert(
+            "lora_unet_something_else.lora_down.weight".to_string(),
+            t2(&[1.], 1, 1),
+        );
+        lora.insert(
+            "lora_unet_something_else.lora_up.weight".to_string(),
+            t2(&[1.], 1, 1),
+        );
+        let err =
+            build_unet_lora_plan(&unet_names(), &lora, 1.0).expect_err("zero matches must fail");
+        assert!(
+            format!("{err:#}").contains("matched 0 UNet layers"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn plan_incomplete_pair_is_not_a_match() {
+        let mut lora = diffusers_lora(None);
+        lora.remove(&format!("{LORA_BASE}.lora_up.weight"));
+        assert!(build_unet_lora_plan(&unet_names(), &lora, 1.0).is_err());
+    }
+
+    #[test]
+    fn plan_ldm_format_fallback() {
+        let mut lora = HashMap::new();
+        let base = "lora_unet_input_blocks_4_1_transformer_blocks_0_attn1_to_q";
+        lora.insert(format!("{base}.lora_down.weight"), t2(&[0.5; 32], 4, 8));
+        lora.insert(format!("{base}.lora_up.weight"), t2(&[1.; 12], 3, 4));
+        let plan = build_unet_lora_plan(&unet_names(), &lora, 1.0).expect("plan builds");
+        assert_eq!(plan.applied(), 1);
+        assert!(plan.merges().contains_key(W_KEY), "ldm key maps to {W_KEY}");
+    }
+
+    #[test]
+    fn plan_diffusers_wins_over_mixed_ldm() {
+        let mut lora = diffusers_lora(None);
+        let ldm_base = "lora_unet_input_blocks_4_1_transformer_blocks_0_attn1_to_q";
+        lora.insert(format!("{ldm_base}.lora_down.weight"), t2(&[0.5; 32], 4, 8));
+        lora.insert(format!("{ldm_base}.lora_up.weight"), t2(&[1.; 12], 3, 4));
+        let plan = build_unet_lora_plan(&unet_names(), &lora, 1.0).expect("plan builds");
+        // Pass 1 matched, so the ldm keys must be ignored (no double-apply).
+        assert_eq!(plan.applied(), 1);
+        assert!(plan.merges().contains_key(W_KEY));
+    }
+
+    #[test]
+    fn merge_math_is_exact_for_dyadic_values() {
+        // up @ down with the diffusers_lora fixture: each up row picks the
+        // matching down row (identity-like up), so delta rows equal down
+        // rows 0..2; scale 0.5 on an all-ones base.
+        let lora = diffusers_lora(None);
+        let up = lora
+            .get(&format!("{LORA_BASE}.lora_up.weight"))
+            .expect("up");
+        let down = lora
+            .get(&format!("{LORA_BASE}.lora_down.weight"))
+            .expect("down");
+        let w = t2(&[1.; 24], 3, 8);
+        let merged = merge_lora_weight(&w, up, down, 0.5).expect("merge");
+        let got = merged.to_vec2::<f32>().expect("vec2");
+        // merged = 1 + 0.5 * delta, delta diagonal = 0.5 (rows 0..2 of up
+        // pick down rows 0..2).
+        assert_eq!(got[0], vec![1.25, 1., 1., 1., 1., 1., 1., 1.]);
+        assert_eq!(got[1], vec![1., 1.25, 1., 1., 1., 1., 1., 1.]);
+        assert_eq!(got[2], vec![1., 1., 1.25, 1., 1., 1., 1., 1.]);
+        // Base dtype is restored.
+        assert_eq!(merged.dtype(), w.dtype());
+    }
+
+    #[test]
+    fn lazy_backend_matches_eager_merge() {
+        let dir = std::env::temp_dir().join(format!(
+            "etch-lora-test-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        // A tiny safetensors file standing in for the UNet: one LoRA target
+        // and one untouched weight.
+        let w = t2(&[1.; 24], 3, 8);
+        let plain = t2(&[7.; 6], 2, 3);
+        let mut base_map = HashMap::new();
+        base_map.insert(W_KEY.to_string(), w.clone());
+        base_map.insert("plain.weight".to_string(), plain.clone());
+        let st_path = dir.join("unet.safetensors");
+        candle_core::safetensors::save(&base_map, &st_path).expect("save base");
+
+        let lora = std::sync::Arc::new(diffusers_lora(None));
+        // SAFETY: the test file is not modified while mapped.
+        let base =
+            unsafe { candle_core::safetensors::MmapedSafetensors::new(&st_path).expect("mmap") };
+        let names: Vec<String> = base.tensors().into_iter().map(|(n, _)| n).collect();
+        let plan = build_unet_lora_plan(&names, &lora, 0.5).expect("plan");
+        let backend = LazyLoraBackend::new(base, lora, plan);
+
+        use candle_nn::var_builder::SimpleBackend as _;
+        let got = backend
+            .get(
+                candle_core::Shape::from((3, 8)),
+                W_KEY,
+                candle_nn::Init::Const(0.),
+                DType::F32,
+                &Device::Cpu,
+            )
+            .expect("merged get");
+        let want = merge_lora_weight(
+            &w,
+            &diffusers_lora(None)[&format!("{LORA_BASE}.lora_up.weight")],
+            &diffusers_lora(None)[&format!("{LORA_BASE}.lora_down.weight")],
+            0.5,
+        )
+        .expect("eager merge");
+        assert_eq!(
+            got.to_vec2::<f32>().expect("vec2"),
+            want.to_vec2::<f32>().expect("vec2"),
+            "lazy merge must equal eager merge"
+        );
+
+        // Unmerged weights pass through untouched.
+        let got_plain = backend
+            .get(
+                candle_core::Shape::from((2, 3)),
+                "plain.weight",
+                candle_nn::Init::Const(0.),
+                DType::F32,
+                &Device::Cpu,
+            )
+            .expect("plain get");
+        assert_eq!(
+            got_plain.to_vec2::<f32>().expect("vec2"),
+            plain.to_vec2::<f32>().expect("vec2")
+        );
+        assert!(backend.contains_tensor("plain.weight"));
+        assert!(!backend.contains_tensor("absent.weight"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lazy_backend_shape_error_names_tensor() {
+        let dir = std::env::temp_dir().join(format!(
+            "etch-lora-shape-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut base_map = HashMap::new();
+        base_map.insert(W_KEY.to_string(), t2(&[1.; 24], 3, 8));
+        let st_path = dir.join("unet.safetensors");
+        candle_core::safetensors::save(&base_map, &st_path).expect("save base");
+
+        let lora = std::sync::Arc::new(diffusers_lora(None));
+        // SAFETY: the test file is not modified while mapped.
+        let base =
+            unsafe { candle_core::safetensors::MmapedSafetensors::new(&st_path).expect("mmap") };
+        let names: Vec<String> = base.tensors().into_iter().map(|(n, _)| n).collect();
+        let plan = build_unet_lora_plan(&names, &lora, 1.0).expect("plan");
+        let backend = LazyLoraBackend::new(base, lora, plan);
+
+        use candle_nn::var_builder::SimpleBackend as _;
+        let err = backend
+            .get(
+                candle_core::Shape::from((4, 4)),
+                W_KEY,
+                candle_nn::Init::Const(0.),
+                DType::F32,
+                &Device::Cpu,
+            )
+            .expect_err("wrong shape must fail");
+        assert!(format!("{err:?}").contains("shape mismatch for"), "{err:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
