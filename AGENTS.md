@@ -129,7 +129,7 @@ Source tree (`src/**/*.rs`):
 | `hub.rs` | HuggingFace Hub fetch helpers + model-size logging |
 | `image.rs` | Save a 3-channel tensor to PNG or JPEG |
 | `logger.rs` | Append run results to `log.jsonl` |
-| `lora.rs` | LoRA weight merging for UNet and text encoders |
+| `lora.rs` | LoRA merge planning (diffusers/ldm kohya formats), shared merge math, lazy UNet VarBuilder backend |
 | `progress.rs` | Shared `indicatif` denoising progress bar |
 | `schedulers.rs` | SDXL Karras Euler-A and DPM++ 2M Karras schedulers |
 | `signals.rs` | Ctrl-C handling: interrupt flag polled at step/seed boundaries |
@@ -204,7 +204,7 @@ The two-phase split lets batch runs (`--seed-range`) load weights once instead o
 - Schedulers: `euler-a`, `euler-a-karras`, `dpm2m-karras`. Custom Karras schedulers live in `src/schedulers.rs`.
 - Loads two text encoders (CLIP-1 ViT-L/14, CLIP-2 ViT-bigG) and concatenates embeddings along hidden dim to 2048.
 - Supports LoRA for UNet and both text encoders (`--lora`, `--lora-scale`).
-- Loads the UNet architecture from the model's own `unet/config.json` (diffusers format) for both the plain and LoRA paths; only the VarBuilder differs (mmaped vs LoRA-merged owned tensors).
+- Loads the UNet architecture from the model's own `unet/config.json` (diffusers format) for both the plain and LoRA paths; only the VarBuilder differs (mmaped base vs `LazyLoraBackend`).
 - `prepare` loads embeddings (or reuses the disk cache), UNet, and VAE; the UNet stays resident during decode for batch reuse. The scheduler is recreated per `generate` call (`Dpm2mKarrasScheduler` carries mutable per-step state).
 
 ### Device selection (`src/device.rs`)
@@ -272,7 +272,8 @@ Defined in `src/cli.rs` (clap derive). Key flags:
 - **GGUF models force dtype=F32 and DiT on CPU** — quantized weights dequantize to F32; mixing BF16 tensors with F32 weights fails in matmul. The DiT also runs on CPU to avoid device mismatches and Metal OOM.
 - **`--guidance-scale` is SDXL-only** (typical range ~5–10). FLUX dev uses `--flux-guidance` (default 3.5); `schnell` ignores guidance because it is distilled. These are separate flags with different semantics.
 - **SDXL default resolution is 768×1024**, not the SDXL-standard 1024×1024. FLUX defaults to 768×1360.
-- **UNet architecture comes from `unet/config.json`** — both UNet load paths (with and without LoRA) parse the diffusers config into `UNet2DConditionModelConfig` via `src/sdxl/config.rs`. Only the VarBuilder differs: mmaped safetensors without LoRA, owned tensors after the LoRA merge with `--lora`. CLIP/VAE configs still come from candle's hardcoded `StableDiffusionConfig::sdxl`.
+- **UNet architecture comes from `unet/config.json`** — both UNet load paths (with and without LoRA) parse the diffusers config into `UNet2DConditionModelConfig` via `src/sdxl/config.rs`. Only the VarBuilder differs: mmaped safetensors without LoRA, `LazyLoraBackend` (mmap base + per-layer lazy merge) with `--lora`. CLIP/VAE configs still come from candle's hardcoded `StableDiffusionConfig::sdxl`.
+- **UNet LoRA merge is lazy** — with `--lora`, the UNet is built via `VarBuilder::from_backend` over `LazyLoraBackend` (`src/lora.rs`): non-merged weights are read straight from the mmaped base safetensors, merged layers are computed on first access as `W + scale * U @ D` in F32 on the CPU and moved to the device. There is no full CPU copy of the UNet anymore, so peak RAM with `--lora` drops by roughly the UNet's size. Text encoders still merge eagerly (`apply_te_lora`) — they are small. Conv-LoRA (4-D weight updates) are not supported: they fail with a shape error naming the tensor.
 - **`log.jsonl` appends are atomic** — each entry is formatted into a single string and written with one `write_all` on an append-mode file (`O_APPEND` / `FILE_APPEND_DATA`), so parallel runs cannot interleave lines. Do not switch back to `writeln!` on the raw `File` — its formatting adaptor can split a line across multiple syscalls.
 - **Batch mode continues on failure** — if one seed fails, the loop proceeds to the next seed.
 - **Batch mode keeps weights resident** — `prepare` loads DiT/UNet **and** VAE once; the denoiser stays in memory during VAE decode (tradeoff for fast batch runs). Mitigations on tight memory: `--vae-cpu`, `--vae-tile-size`, GGUF models.
