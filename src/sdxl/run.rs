@@ -319,10 +319,18 @@ fn prepare_sdxl(args: &Args, device: &Device, dtype: DType) -> Result<SdxlPrepar
                 device.clone(),
             ))?
         } else {
-            // SAFETY: the safetensors file is owned by the HF cache or the
-            // local model directory and is not modified during inference.
-            let vb =
-                unsafe { VarBuilder::from_mmaped_safetensors(&[unet_weights], dtype, device)? };
+            // Stream the UNet weights with positional reads instead of an
+            // mmap: model construction touches practically every page, and a
+            // long-lived full-file mapping would keep all of them resident in
+            // RSS. Same tradeoff as the LoRA path — peak memory is the
+            // resident model plus one tensor's worth of temporaries.
+            let vb = VarBuilder::from_backend(
+                Box::new(crate::safetensors_stream::StreamingBackend::open(&[
+                    unet_weights,
+                ])?),
+                dtype,
+                device.clone(),
+            );
             build(vb)?
         }
     };

@@ -13,15 +13,6 @@
 
 ## 2. Надёжность и управление ресурсами
 
-- [ ] **`pread`-once для обычного SDXL UNet**
-  Перенести `StreamingTensors` из `lora.rs` в общий модуль и добавить
-  `StreamingBackend` (SimpleBackend без LoRA) для пути без `--lora` в
-  `sdxl/run.rs`. Замер (тёплый embedding cache, Araminta, 512×512, 1 шаг,
-  минимум 3 чередующиеся пары): mmap сейчас даёт ~10,31 GB RSS, ожидается
-  ~6–7 GB. Критерий merge: −25–30% к среднему RSS без заметной деградации
-  denoising. Дорожная карта: PR 0 (закрытие WIP) → этот пункт → замер →
-  только при недостаточности ~6–7 GB — условный forward-streaming spike.
-
 - [ ] **Условный SDXL forward-streaming эксперимент**
   Начинать только если `pread`-once (~6–7 GB) недостаточно. Ветка-эксперимент
   `exp/sdxl-forward-streaming`: собирать down/mid/up-блоки через streaming
@@ -149,6 +140,17 @@
 
 ## Уже реализовано
 
+- [x] **`pread`-once для обычного SDXL UNet** — PR #44.
+  `StreamingTensors` вынесен из `lora.rs` в общий модуль
+  `src/safetensors_stream.rs`, добавлен `StreamingBackend` (SimpleBackend без
+  LoRA); обычный путь UNet в `sdxl/run.rs` собирается через него вместо
+  `VarBuilder::from_mmaped_safetensors`. LoRA-путь использует тот же loader
+  через `LazyLoraBackend`. Поддержан `F8_E4M3` (регрессия против mmap).
+  Замер (тёплый embedding cache, Araminta, 512×512, 1 шаг, 3 чередующиеся
+  пары): **10,31 → 5,64 GB RSS (−45,3%)**, контроль с LoRA ≈ 6,38 GB как в
+  PR #42. Тесты: парсер (5 regression) + backend против mmap (равенство
+  значений, BF16/FP8 → F32, contains/missing/shape mismatch). Всего 59 тестов.
+
 - [x] **Закрыт WIP `feature/ssd-streaming`** — PR #43.
   Последнее состояние сохранено по SHA `e0f8240` («wip: preserve SDXL
   streaming forward + UNet structure analysis»). Причины закрытия: ручной
@@ -183,8 +185,8 @@
   `down_block_types`, `attention_head_dim`, `transformer_layers_per_block` — и
   скалярная, и массивная формы — и остальные поля) в `UNet2DConditionModelConfig`.
   Оба пути загрузки UNet (с LoRA и без) используют его; отличается только
-  VarBuilder: mmaped safetensors без LoRA, `LazyLoraBackend` (стриминг +
-  послойный мерж) с LoRA. Неподдерживаемые
+  VarBuilder: `StreamingBackend` (стриминг) без LoRA, `LazyLoraBackend`
+  (стриминг + послойный мерж) с LoRA. Неподдерживаемые
   блоки (`AttnDownBlock2D`) и рассинхрон массивов дают понятную ошибку. Тесты на
   парсинг SDXL-base конфига, скалярные формы, ошибки.
 
