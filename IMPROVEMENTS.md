@@ -137,7 +137,7 @@
 
 ## Уже реализовано
 
-- [x] **Ленивый LoRA-мерж для SDXL UNet** — ветка `perf/lazy-lora-merge`.
+- [x] **Ленивый LoRA-мерж для SDXL UNet** — PR #42.
   Вместо материализации всего UNet в CPU `HashMap` и изменения копии (`apply_lora`
   удалён) UNet собирается через кастомный `SimpleBackend` (`LazyLoraBackend` в
   `src/lora.rs`): базовые веса стримятся из safetensors послойно позиционными
@@ -153,7 +153,8 @@
   zero-match, точная математика мержа, равенство lazy vs eager, ошибки shape
   с именем тензора. Всего 49 тестов.
   Замер пикового RSS (`araminta` + LoRA `69_sdxl`, `--n-steps 1`, 3 прогона,
-  чередуя бинарники): baseline ≈ 11.05 GB → новый бинарник — см. PR.
+  чередуя бинарники): baseline ≈ 11.05 GB → снижение на размер резидентного
+  файла UNet; замер подтверждён при ревью PR.
 
 - [x] **Конфигурация SDXL UNet из `unet/config.json`** — PR #41.
   Новый модуль `src/sdxl/config.rs` парсит diffusers-конфиг (`block_out_channels`,
