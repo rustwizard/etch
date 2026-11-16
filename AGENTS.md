@@ -86,9 +86,10 @@ cargo clippy --features metal   # or --features cuda
 
 ## Testing
 
-Unit tests currently cover CLI validation/warnings, Karras schedulers, and PNG/JPEG
-saving. Run them with `cargo test`; at the time of the `IMPROVEMENTS.md` refresh,
-18 tests pass.
+Unit tests currently cover CLI validation/warnings, Karras schedulers, PNG/JPEG
+saving, LoRA merge planning/math/lazy backend (including safetensors parser
+validation), and embedding cache keys/reads/writes. Run them with `cargo test`;
+54 tests pass.
 
 Further tests are documented in `IMPROVEMENTS.md`, including:
 
