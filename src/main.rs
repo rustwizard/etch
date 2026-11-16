@@ -10,6 +10,7 @@ mod logger;
 mod lora;
 mod pipeline;
 mod progress;
+mod safetensors_stream;
 mod schedulers;
 mod sdxl;
 mod signals;
