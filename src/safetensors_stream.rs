@@ -212,6 +212,8 @@ fn dtype_from_str(s: &str) -> Option<DType> {
         "I16" => DType::I16,
         "U8" => DType::U8,
         "U32" => DType::U32,
+        // The Candle mmap loader accepts FP8; the streaming path must too.
+        "F8_E4M3" => DType::F8E4M3,
         _ => return None,
     })
 }
@@ -478,6 +480,40 @@ mod tests {
             )
             .expect_err("shape mismatch must error");
         assert!(format!("{err}").contains("w_f32"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn streaming_matches_mmap_on_fp8() {
+        // F8_E4M3 bytes: 1.0 = 0x38, 2.0 = 0x40 (e4m3fn, bias 7). The Candle
+        // mmap loader reads this dtype; the streaming parser must accept it
+        // too and produce the same F32 values.
+        let dir = unique_dir("fp8");
+        let header = serde_json::json!({
+            "t": {"dtype": "F8_E4M3", "shape": [2], "data_offsets": [0, 2]},
+        });
+        let path = dir.join("fp8.safetensors");
+        std::fs::write(&path, raw_st_file(&header, &[0x38, 0x40])).expect("write fp8 file");
+
+        let streamed = StreamingTensors::open(&[&path])
+            .expect("fp8 file opens")
+            .read("t", &Device::Cpu)
+            .expect("read")
+            .expect("present")
+            .to_dtype(DType::F32)
+            .expect("cast");
+        // SAFETY: the test file is not modified while mapped.
+        let mapped = unsafe { candle_core::safetensors::MmapedSafetensors::new(&path) }
+            .expect("mmap fp8")
+            .load("t", &Device::Cpu)
+            .expect("mmap load")
+            .to_dtype(DType::F32)
+            .expect("cast");
+        assert_eq!(
+            streamed.to_vec1::<f32>().expect("vec"),
+            mapped.to_vec1::<f32>().expect("vec"),
+        );
+        assert_eq!(streamed.to_vec1::<f32>().expect("vec"), vec![1.0, 2.0]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
