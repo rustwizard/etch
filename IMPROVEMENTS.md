@@ -149,7 +149,7 @@
 
 ## Уже реализовано
 
-- [x] **Закрыт WIP `feature/ssd-streaming`** — ветка `docs/retire-ssd-streaming`.
+- [x] **Закрыт WIP `feature/ssd-streaming`** — PR #43.
   Последнее состояние сохранено по SHA `e0f8240` («wip: preserve SDXL
   streaming forward + UNet structure analysis»). Причины закрытия: ручной
   forward не воспроизводит Candle UNet; флаги не были подключены; dense UNet
